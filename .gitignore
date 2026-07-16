@@ -1,0 +1,9 @@
+# build artifacts
+/mlaunch-go
+/dist/
+
+# runtime artifacts
+/sandboxes/
+/downloads/
+*.tgz
+*.tar.gz
