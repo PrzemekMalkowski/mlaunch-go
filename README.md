@@ -1,6 +1,6 @@
 # mlaunch-go
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/PrzemekMalkowski/mlaunch-go)](https://goreportcard.com/report/github.com/PrzemekMalkowski/mlaunch-go)
+[![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Release](https://img.shields.io/github/v/release/PrzemekMalkowski/mlaunch-go)](https://github.com/PrzemekMalkowski/mlaunch-go/releases)
 
@@ -47,7 +47,8 @@ automatically download matching binaries for recent MongoDB versions
     <td align="center"><img src="screenshot.png" alt="screenshot" width="900" /></td>
   </tr>
 </table>
----------------------
+
+
 ## Install
 
 Prebuilt Linux binaries (x86_64 and aarch64) are on the
