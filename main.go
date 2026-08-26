@@ -22,7 +22,7 @@ import (
 
 // version is the tool version, shown by 'mlaunch-go version'.
 // version is set at build time by goreleaser via -ldflags.
-var version = "dev"
+var version = "0.2.0"
 
 const usage = `mlaunch-go — launch sandbox MongoDB environments (Go rewrite of mlaunch)
 
@@ -52,7 +52,9 @@ Usage:
   mlaunch-go version                                  print the mlaunch-go version
 
 show-repo options:
-  --distro NAME         "mongodb", "percona", or "all" (default "all")
+  --distro NAME         "mongodb", "percona", "search", or "all"
+                        (default "all" = mongodb + percona; "search" lists
+                        Percona Search / mongot releases)
   --major M             filter by major version, e.g. --major 8 or --major 8.0
   --stable yes|no       only production releases (yes) or only rc/dev builds (no)
   --download-dir DIR    where downloads are detected (default "downloads")
@@ -67,6 +69,9 @@ init options:
   --config N            number of config servers for --sharded (default 1)
   --mongos N            number of mongos routers for --sharded (default 1)
   --auth                enable authentication; creates user mlaunch / pa33word
+  --percona-search      run Percona Search (mongot) alongside the servers for
+                        $search / $vectorSearch; implies --distro percona,
+                        --replicaset and --auth, and needs PSMDB 8.3 or later
   --port PORT           base port (default: derived from version)
   --dir ROOT            sandboxes root directory (default "./sandboxes")
 
@@ -76,6 +81,13 @@ binary resolution (in priority order):
   --version X.Y.Z       version to download (required unless --binary-dir/--url)
   --distro NAME         "mongodb" (community, default) or "percona"
   --download-dir DIR    where tarballs are downloaded/extracted (default "downloads")
+  --search-version V    Percona Search (mongot) version (default 1.70.3)
+  --search-binary-dir D use an existing extracted Percona Search directory
+  --search-url URL      download this exact mongot tarball
+  --search-disk-threshold F
+                        warn when the sandbox volume is more than this full
+                        (default 0.95); mongot pauses replication when its
+                        data volume fills up, leaving indexes PENDING
 
 misc:
   --verbose             print launched commands and download probing
@@ -89,6 +101,8 @@ Examples:
   mlaunch-go destroy --env replicaset-3n-8.0.26
   mlaunch-go init --sharded 2 --nodes 3 --version 8.0.26
   mlaunch-go init --single --distro percona --version 8.0.4-1
+  mlaunch-go init --percona-search --version 8.3.7-1
+  mlaunch-go init --percona-search --sharded 2 --nodes 3 --version 8.3.7-1
   mlaunch-go list
   mlaunch-go stop --env replicaset-3n-8.0.26
   mlaunch-go stop --port 28027              # stop a single member (e.g. force a failover)
@@ -194,6 +208,12 @@ func cmdInit(args []string) error {
 	distro := fs.String("distro", "mongodb", "")
 	downloadDir := fs.String("download-dir", "downloads", "")
 
+	search := fs.Bool("percona-search", false, "")
+	searchVersion := fs.String("search-version", download.DefaultSearchVersion, "")
+	searchURL := fs.String("search-url", "", "")
+	searchBinaryDir := fs.String("search-binary-dir", "", "")
+	searchDiskThreshold := fs.Float64("search-disk-threshold", cluster.DefaultSearchDiskThreshold, "")
+
 	verbose := fs.Bool("verbose", false, "")
 	dryRun := fs.Bool("dry-run", false, "")
 
@@ -201,6 +221,26 @@ func cmdInit(args []string) error {
 		return err
 	}
 	extraArgs := fs.Args() // everything after "--"
+
+	// --percona-search implies a Percona 8.3+ replica set with auth:
+	// mongot replicates through a change stream and authenticates with
+	// SCRAM. Only contradict the user when they asked for something else
+	// explicitly.
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if *search {
+		if explicit["distro"] && *distro != string(download.DistPercona) {
+			return fmt.Errorf("--percona-search requires --distro percona (mongot needs Percona Server for MongoDB 8.3 or later)")
+		}
+		*distro = string(download.DistPercona)
+		if !explicit["replicaset"] && *sharded == 0 {
+			*replset = true
+		}
+		*auth = true
+		if *version == "" && *rawURL == "" && *binaryDir == "" {
+			return fmt.Errorf("--percona-search needs a server version, e.g. --version 8.3.7-1 (see: mlaunch-go show-repo --distro percona --major 8.3)")
+		}
+	}
 
 	binDir := *binaryDir
 	if binDir == "" || *dryRun {
@@ -229,6 +269,17 @@ func cmdInit(args []string) error {
 			for _, u := range urls {
 				fmt.Println("  " + u)
 			}
+			if *search && *searchBinaryDir == "" {
+				u, err := download.ResolveMongot(download.MongotOptions{
+					Version: *searchVersion,
+					URL:     *searchURL,
+				}, host)
+				if err != nil {
+					return err
+				}
+				fmt.Println("Percona Search tarball:")
+				fmt.Println("  " + u)
+			}
 			return nil
 		}
 
@@ -238,6 +289,39 @@ func cmdInit(args []string) error {
 		}
 		fmt.Printf("using binaries from %s\n", res.BinDir)
 		binDir = filepath.Join(res.BinDir, "bin")
+	}
+
+	// Percona Search binaries. Unlike the server tarballs there is
+	// nothing to probe: the mongot build is distro-agnostic (it bundles
+	// its own OpenJDK), so only the architecture varies.
+	searchBin := *searchBinaryDir
+	if *search && searchBin == "" {
+		host, err := platform.Detect()
+		if err != nil {
+			return err
+		}
+		res, err := download.FetchMongot(download.MongotOptions{
+			Version:     *searchVersion,
+			DownloadDir: *downloadDir,
+			URL:         *searchURL,
+			Quiet:       !*verbose,
+		}, host)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("using Percona Search binaries from %s\n", res.BinDir)
+		searchBin = res.BinDir
+	}
+	absSearchBin := ""
+	if searchBin != "" {
+		if err := download.ValidateMongotDir(searchBin); err != nil {
+			return err
+		}
+		abs, err := filepath.Abs(searchBin)
+		if err != nil {
+			return err
+		}
+		absSearchBin = abs
 	}
 
 	// The version is used for the environment name and default ports.
@@ -276,6 +360,12 @@ func cmdInit(args []string) error {
 		Version:    envVersion,
 		ExtraArgs:  extraArgs,
 		Verbose:    *verbose,
+
+		Search:        *search,
+		SearchBinDir:  absSearchBin,
+		SearchVersion: *searchVersion,
+
+		SearchDiskThreshold: *searchDiskThreshold,
 	}
 
 	// The full summary (paths, ports, connection string) is printed by Init.
@@ -449,7 +539,7 @@ func cmdList(args []string) error {
 
 func cmdShowRepo(args []string) error {
 	fs := flag.NewFlagSet("show-repo", flag.ExitOnError)
-	distro := fs.String("distro", "all", "mongodb | percona | all")
+	distro := fs.String("distro", "all", "mongodb | percona | search | all")
 	major := fs.String("major", "", "major version filter, e.g. 8 or 8.0")
 	stable := fs.String("stable", "", `stability filter: "yes" (production releases only) or "no" (rc/dev only)`)
 	downloadDir := fs.String("download-dir", "downloads", "where downloads are detected")
@@ -460,6 +550,11 @@ func cmdShowRepo(args []string) error {
 	case "", "yes", "no":
 	default:
 		return fmt.Errorf(`invalid --stable value %q (want "yes" or "no")`, *stable)
+	}
+	switch *distro {
+	case "all", "mongodb", "percona", "search":
+	default:
+		return fmt.Errorf(`invalid --distro value %q (want "mongodb", "percona", "search" or "all")`, *distro)
 	}
 
 	host, err := platform.Detect()
@@ -486,6 +581,15 @@ func cmdShowRepo(args []string) error {
 		}
 		entries = append(entries, psmdb...)
 	}
+	// Percona Search is versioned independently of the server (1.70.3 vs
+	// 8.3.7-1), so it is listed on request rather than as part of "all".
+	if *distro == "search" {
+		psearch, err := download.ListRemoteSearch(*major)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, psearch...)
+	}
 
 	rows := make([][]string, 0, len(entries))
 	for _, e := range entries {
@@ -502,7 +606,7 @@ func cmdShowRepo(args []string) error {
 		if e.Dist == download.DistMongoDB && !e.HostBuild {
 			hostBuild = "-"
 		}
-		if local[string(e.Dist)+":"+e.Version] {
+		if local[download.LocalKey(e.Dist, e.Version)] {
 			downloaded = "yes"
 		}
 		rows = append(rows, []string{e.Version, string(e.Dist), stableCol, hostBuild, downloaded})
@@ -514,6 +618,9 @@ func cmdShowRepo(args []string) error {
 	table.Render(os.Stdout, []string{"VERSION", "DISTRO", "STABLE", "HOST BUILD", "DOWNLOADED"}, rows)
 	if *major == "" {
 		fmt.Println("hint: narrow the list with --major, e.g. --major 8.0")
+	}
+	if *distro == "search" {
+		fmt.Println("hint: launch a version with: mlaunch-go init --percona-search --version 8.3.x --search-version <VERSION>")
 	}
 	return nil
 }

@@ -60,6 +60,16 @@ type Topology struct {
 	ExtraArgs  []string
 	Verbose    bool
 
+	// Search launches Percona Search (mongot) alongside the servers. It
+	// implies Auth and a replica set, and requires Percona Server for
+	// MongoDB 8.3 or later. See mongot.go.
+	Search        bool
+	SearchBinDir  string // directory containing the mongot launcher
+	SearchVersion string // mongot version, for the summary only
+	// SearchDiskThreshold is the sandbox volume usage fraction above
+	// which init warns; 0 means DefaultSearchDiskThreshold.
+	SearchDiskThreshold float64
+
 	// dir is the resolved per-environment directory (inside RootDir).
 	dir string
 	// keyFile is the generated keyfile path when Auth is set for a
@@ -77,6 +87,11 @@ type Node struct {
 	ConfPath string   `json:"confPath"`
 	Args     []string `json:"args"`
 	PID      int      `json:"pid"`
+
+	// mongot only: Port holds the gRPC port mongod talks to, these are
+	// the health-check and metrics listeners.
+	HealthPort  int `json:"healthPort,omitempty"`
+	MetricsPort int `json:"metricsPort,omitempty"`
 }
 
 // State is persisted to <envdir>/.mlaunch_startup.json.
@@ -90,6 +105,10 @@ type State struct {
 	BasePort  int       `json:"basePort"`
 	Auth      bool      `json:"auth,omitempty"`
 	KeyFile   string    `json:"keyFile,omitempty"`
+	// Search records that mongot processes belong to this environment;
+	// SearchBinDir is needed to restart them.
+	Search       bool   `json:"search,omitempty"`
+	SearchBinDir string `json:"searchBinDir,omitempty"`
 	// Complete is false while init is still launching processes; a state
 	// file with Complete=false marks a failed/interrupted init.
 	Complete bool    `json:"complete"`
@@ -257,6 +276,12 @@ func planPorts(root string, preferred, count int) (int, error) {
 		if st, err := LoadState(d); err == nil {
 			for _, n := range st.Nodes {
 				reserved[n.Port] = true
+				if n.HealthPort > 0 {
+					reserved[n.HealthPort] = true
+				}
+				if n.MetricsPort > 0 {
+					reserved[n.MetricsPort] = true
+				}
 			}
 		}
 	}
@@ -324,8 +349,16 @@ func Init(t *Topology) (*State, error) {
 	if err := t.validate(); err != nil {
 		return nil, err
 	}
+	if t.Search {
+		warnSearchResources(t)
+	}
 
 	envName := EnvName(t.kind(), t.TotalMembers(), t.Version)
+	if t.Search {
+		// mongot processes are not counted as members, so the
+		// environment is distinguished by a suffix instead.
+		envName += "-search"
+	}
 	t.dir = filepath.Join(t.RootDir, envName)
 	if _, err := LoadState(t.dir); err == nil {
 		return nil, fmt.Errorf("environment %s already exists in %s; use 'mlaunch-go start --env %s' or 'mlaunch-go destroy --env %s'",
@@ -340,19 +373,27 @@ func Init(t *Topology) (*State, error) {
 	if preferred <= 0 {
 		preferred = VersionBasePort(t.Version)
 	}
-	base, err := planPorts(t.RootDir, preferred, t.TotalMembers())
+	base, err := planPorts(t.RootDir, preferred, t.TotalPorts())
 	if err != nil {
 		return nil, err
 	}
 	t.Port = base
 	if t.Verbose {
-		fmt.Fprintf(os.Stderr, "environment %s: ports %d-%d\n", envName, base, base+t.TotalMembers()-1)
+		fmt.Fprintf(os.Stderr, "environment %s: ports %d-%d\n", envName, base, base+t.TotalPorts()-1)
 	}
 
 	// Keyfile for internal auth (multi-process topologies only).
 	if t.Auth && t.kind() != "standalone" {
 		t.keyFile = filepath.Join(t.dir, "keyfile")
 		if err := writeKeyFile(t.keyFile); err != nil {
+			return nil, err
+		}
+	}
+
+	// Password file read by mongot (no trailing newline, or it would
+	// become part of the password).
+	if t.Search {
+		if err := writeSearchPasswordFile(filepath.Join(t.dir, searchPasswordFile)); err != nil {
 			return nil, err
 		}
 	}
@@ -367,6 +408,9 @@ func Init(t *Topology) (*State, error) {
 		Auth:      t.Auth,
 		KeyFile:   t.keyFile,
 		Dir:       t.dir,
+
+		Search:       t.Search,
+		SearchBinDir: t.SearchBinDir,
 	}
 	// Persist immediately and after every spawn (see spawn()), so that a
 	// failed init leaves a state file behind: 'list' shows it as
@@ -410,6 +454,10 @@ func Init(t *Topology) (*State, error) {
 	if t.Auth {
 		fmt.Printf("authentication enabled; default user: '%s' / '%s'\n", DefaultUser, DefaultPassword)
 	}
+	if t.Search {
+		fmt.Printf("Percona Search enabled: %d mongot process(es), replication user '%s'\n",
+			t.searchInstances(), SearchUser)
+	}
 	if connAddr != "" {
 		fmt.Printf("connect: %s\n", table.Cyan(connString(st, connAddr)))
 	}
@@ -430,6 +478,24 @@ func (t *Topology) validate() error {
 	}
 	if t.Single && t.ReplicaSet {
 		return fmt.Errorf("--single and --replicaset are mutually exclusive")
+	}
+	if t.Search {
+		if t.Single {
+			return fmt.Errorf("--percona-search cannot be combined with --single: mongot replicates through a change stream, so a replica set (or sharded cluster) is required")
+		}
+		if t.Sharded == 0 {
+			t.ReplicaSet = true // implied
+		}
+		t.Auth = true // mongot authenticates with SCRAM; implied
+		if t.SearchBinDir == "" {
+			return fmt.Errorf("no Percona Search binary directory resolved")
+		}
+		if _, err := os.Stat(filepath.Join(t.SearchBinDir, "mongot")); err != nil {
+			return fmt.Errorf("mongot not found in %s: %w", t.SearchBinDir, err)
+		}
+		if !searchCompatible(t.Version) {
+			return fmt.Errorf("Percona Search requires Percona Server for MongoDB 8.3 or later (got version %q); see: mlaunch-go show-repo --distro percona --major 8.3", t.Version)
+		}
 	}
 	if t.Arbiters < 0 {
 		return fmt.Errorf("--arbiter must be >= 0")
@@ -469,7 +535,7 @@ func writeKeyFile(path string) error {
 // mongodConf renders the per-instance mongod.conf. Optional sections that
 // are not in use are included as commented-out template hints, so the file
 // doubles as a starting point for manual tweaking.
-func mongodConf(t *Topology, name, dbpath, logPath string, port int, replSet, clusterRole string) string {
+func mongodConf(t *Topology, name, dbpath, logPath string, port int, replSet, clusterRole, mongotAddr string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# mongod.conf for instance %q, generated by mlaunch-go.\n", name)
 	b.WriteString("# Edit freely; changes apply on the next 'mlaunch-go start'.\n")
@@ -506,12 +572,28 @@ func mongodConf(t *Topology, name, dbpath, logPath string, port int, replSet, cl
 		b.WriteString("# security:\n#   authorization: enabled\n#   keyFile: /path/to/keyfile\n\n")
 	}
 
-	b.WriteString("# setParameter:\n#   enableFlowControl: true\n")
+	// mongot wiring. These are startup parameters and mongod tolerates
+	// the endpoint not listening yet, which is why the mongot ports are
+	// planned before anything is launched. mongotHost must match
+	// searchIndexManagementHostAndPort.
+	if mongotAddr != "" {
+		b.WriteString("setParameter:\n")
+		fmt.Fprintf(&b, "  searchIndexManagementHostAndPort: %s\n", mongotAddr)
+		fmt.Fprintf(&b, "  mongotHost: %s\n", mongotAddr)
+		b.WriteString("  skipAuthenticationToSearchIndexManagementServer: false\n")
+		b.WriteString("  useGrpcForSearch: true\n")
+		b.WriteString("  searchTLSMode: disabled\n")
+	} else {
+		b.WriteString("# setParameter:\n#   enableFlowControl: true\n")
+	}
 	return b.String()
 }
 
-// mongosConf renders the per-router mongos.conf.
-func mongosConf(t *Topology, name, logPath string, port int, configDB string) string {
+// mongosConf renders the per-router mongos.conf. mongotAddr enables the
+// search index management commands on the router: without it mongos rejects
+// createSearchIndexes / $listSearchIndexes as unconfigured, even though the
+// shards behind it are wired to their own mongot.
+func mongosConf(t *Topology, name, logPath string, port int, configDB, mongotAddr string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# mongos.conf for instance %q, generated by mlaunch-go.\n", name)
 	b.WriteString("# Edit freely; changes apply on the next 'mlaunch-go start'.\n\n")
@@ -520,6 +602,18 @@ func mongosConf(t *Topology, name, logPath string, port int, configDB string) st
 	b.WriteString("processManagement:\n  fork: true\n\n")
 	fmt.Fprintf(&b, "net:\n  port: %d\n  bindIp: 127.0.0.1\n\n", port)
 	fmt.Fprintf(&b, "sharding:\n  configDB: %s\n\n", configDB)
+
+	if mongotAddr != "" {
+		// Index management is metadata work that mongos fans out to the
+		// shards, each of which talks to its own mongot; the address here
+		// only has to name a reachable mongot (the first shard's).
+		b.WriteString("setParameter:\n")
+		fmt.Fprintf(&b, "  searchIndexManagementHostAndPort: %s\n", mongotAddr)
+		fmt.Fprintf(&b, "  mongotHost: %s\n", mongotAddr)
+		b.WriteString("  skipAuthenticationToSearchIndexManagementServer: false\n")
+		b.WriteString("  useGrpcForSearch: true\n")
+		b.WriteString("  searchTLSMode: disabled\n\n")
+	}
 
 	if t.Auth && t.keyFile != "" {
 		fmt.Fprintf(&b, "security:\n  keyFile: %s\n", t.keyFile)
@@ -532,7 +626,7 @@ func mongosConf(t *Topology, name, logPath string, port int, configDB string) st
 // ---------------------------------------------------------------- topologies
 
 func initSingle(t *Topology, st *State) (string, error) {
-	n, err := launchMongod(t, st, "single", t.Port, filepath.Join(t.dir, "data", "db"), "", "")
+	n, err := launchMongod(t, st, "single", t.Port, filepath.Join(t.dir, "data", "db"), "", "", "")
 	if err != nil {
 		return "", err
 	}
@@ -549,7 +643,7 @@ func initSingle(t *Topology, st *State) (string, error) {
 }
 
 func initReplicaSet(t *Topology, st *State) (string, error) {
-	dataPorts, arbPorts, err := launchReplSetMembers(t, st, t.Name, t.Port, t.Nodes, t.Arbiters, "")
+	dataPorts, arbPorts, err := launchReplSetMembers(t, st, t.Name, t.Port, t.Nodes, t.Arbiters, "", t.mongotAddr(0))
 	if err != nil {
 		return "", err
 	}
@@ -561,6 +655,17 @@ func initReplicaSet(t *Topology, st *State) (string, error) {
 		if err := createDefaultUser(primary); err != nil {
 			return "", err
 		}
+	}
+	if t.Search {
+		if err := createSearchUser(primary); err != nil {
+			return "", err
+		}
+		n, err := startSearch(t, st, 0, "mongot", primary, "")
+		if err != nil {
+			return "", err
+		}
+		fmt.Printf("mongot ready on port %d (health %d, metrics %d, pid %d)\n",
+			n.Port, n.HealthPort, n.MetricsPort, n.PID)
 	}
 	if len(arbPorts) > 0 {
 		fmt.Printf("replica set %q initiated (%d data, %d arbiter); primary elected\n",
@@ -581,9 +686,12 @@ func initSharded(t *Topology, st *State) (string, error) {
 	// live on the config servers only, so shard-local users are needed
 	// for direct maintenance connections to individual shards.
 	var shardSpecs []string
+	// With --percona-search, the shard primaries mongot will replicate
+	// from, collected here and used after the routers are up.
+	var shardPrimaries, shardNames []string
 	for s := 1; s <= t.Sharded; s++ {
 		rsName := fmt.Sprintf("sh%02d", s)
-		dataPorts, arbPorts, err := launchReplSetMembers(t, st, rsName, port, t.Nodes, t.Arbiters, "shardsvr")
+		dataPorts, arbPorts, err := launchReplSetMembers(t, st, rsName, port, t.Nodes, t.Arbiters, "shardsvr", t.mongotAddr(s-1))
 		if err != nil {
 			return "", err
 		}
@@ -597,6 +705,19 @@ func initSharded(t *Topology, st *State) (string, error) {
 				return "", fmt.Errorf("shard-local user on %s: %w", rsName, err)
 			}
 		}
+		// Each shard gets its own mongot, replicating from that shard's
+		// primary; the config servers need none. The processes cannot be
+		// launched yet: in a sharded cluster mongot also needs a router,
+		// and no mongos exists until step 3. Only the shard-local part of
+		// the setup (the replication user) is done here, while the
+		// localhost exception makes it cheap.
+		if t.Search {
+			if err := createSearchUser(primary); err != nil {
+				return "", fmt.Errorf("search user on %s: %w", rsName, err)
+			}
+			shardPrimaries = append(shardPrimaries, primary)
+			shardNames = append(shardNames, rsName)
+		}
 		// Only data-bearing members go into the addShard seed list.
 		shardSpecs = append(shardSpecs, rsName+"/"+joinHostPorts(dataPorts))
 		fmt.Printf("shard %s ready (%s)\n", rsName, joinHostPorts(dataPorts))
@@ -607,7 +728,7 @@ func initSharded(t *Topology, st *State) (string, error) {
 
 	// 2. Config server replica set (arbiters are not supported on CSRS).
 	csName := "configRepl"
-	csPorts, _, err := launchReplSetMembers(t, st, csName, port, t.ConfigSrv, 0, "configsvr")
+	csPorts, _, err := launchReplSetMembers(t, st, csName, port, t.ConfigSrv, 0, "configsvr", "")
 	if err != nil {
 		return "", err
 	}
@@ -620,7 +741,14 @@ func initSharded(t *Topology, st *State) (string, error) {
 	// 3. mongos routers.
 	var mongosPorts []int
 	for m := 1; m <= t.Mongos; m++ {
-		n, err := launchMongos(t, st, fmt.Sprintf("mongos%d", m), port, csName+"/"+joinHostPorts(csPorts))
+		// The mongot address is a startup parameter only: the processes
+		// themselves are launched in step 7, after the routers exist.
+		var mongotAddr string
+		if t.Search {
+			mongotAddr = t.mongotAddr(0)
+		}
+		n, err := launchMongos(t, st, fmt.Sprintf("mongos%d", m), port,
+			csName+"/"+joinHostPorts(csPorts), mongotAddr)
 		if err != nil {
 			return "", err
 		}
@@ -670,6 +798,26 @@ func initSharded(t *Topology, st *State) (string, error) {
 			return "", fmt.Errorf("addShard %s: %w", spec, err)
 		}
 	}
+	// 7. One mongot per shard, now that the cluster is complete: mongot
+	// checks at bootstrap that its config matches the real topology, and
+	// a shard only reports itself as sharded once it has been added.
+	// The replication user was created shard-locally in step 1; mongot
+	// also authenticates against the router, and cluster users live on
+	// the config servers, so it has to be created through mongos as well.
+	if t.Search {
+		router := hostPort(mongosPorts[0])
+		if err := createSearchUser(router); err != nil {
+			return "", fmt.Errorf("search user via mongos: %w", err)
+		}
+		for i, rsName := range shardNames {
+			n, err := startSearch(t, st, i, "mongot-"+rsName, shardPrimaries[i], router)
+			if err != nil {
+				return "", fmt.Errorf("mongot for %s: %w", rsName, err)
+			}
+			fmt.Printf("mongot for shard %s ready on port %d (health %d, metrics %d, pid %d)\n",
+				rsName, n.Port, n.HealthPort, n.MetricsPort, n.PID)
+		}
+	}
 	fmt.Printf("sharded cluster ready: %d shard(s), %d config server(s), %d mongos on port(s) %s\n",
 		t.Sharded, t.ConfigSrv, t.Mongos, joinPorts(mongosPorts))
 	return hostPort(mongosPorts[0]), nil
@@ -698,13 +846,13 @@ func createDefaultUser(addr string) error {
 // launchReplSetMembers starts `count` data-bearing members followed by
 // `arbiters` arbiter members on consecutive ports. It returns the data
 // ports and the arbiter ports separately.
-func launchReplSetMembers(t *Topology, st *State, rsName string, basePort, count, arbiters int, clusterRole string) ([]int, []int, error) {
+func launchReplSetMembers(t *Topology, st *State, rsName string, basePort, count, arbiters int, clusterRole, mongotAddr string) ([]int, []int, error) {
 	var dataPorts, arbPorts []int
 	port := basePort
 	for i := 0; i < count; i++ {
 		name := fmt.Sprintf("%s-%d", rsName, i+1)
 		dbpath := filepath.Join(t.dir, "data", rsName, fmt.Sprintf("rs%d", i+1), "db")
-		if _, err := launchMongod(t, st, name, port, dbpath, rsName, clusterRole); err != nil {
+		if _, err := launchMongod(t, st, name, port, dbpath, rsName, clusterRole, mongotAddr); err != nil {
 			return nil, nil, err
 		}
 		dataPorts = append(dataPorts, port)
@@ -713,7 +861,7 @@ func launchReplSetMembers(t *Topology, st *State, rsName string, basePort, count
 	for i := 0; i < arbiters; i++ {
 		name := fmt.Sprintf("%s-arb%d", rsName, i+1)
 		dbpath := filepath.Join(t.dir, "data", rsName, fmt.Sprintf("arb%d", i+1), "db")
-		if _, err := launchMongod(t, st, name, port, dbpath, rsName, clusterRole); err != nil {
+		if _, err := launchMongod(t, st, name, port, dbpath, rsName, clusterRole, mongotAddr); err != nil {
 			return nil, nil, err
 		}
 		arbPorts = append(arbPorts, port)
@@ -770,7 +918,7 @@ func initiateReplSet(name string, dataPorts, arbiterPorts []int, configsvr bool)
 	return mongo.WaitForPrimary(addrs, 120*time.Second)
 }
 
-func launchMongod(t *Topology, st *State, name string, port int, dbpath, replSet, clusterRole string) (*Node, error) {
+func launchMongod(t *Topology, st *State, name string, port int, dbpath, replSet, clusterRole, mongotAddr string) (*Node, error) {
 	if err := os.MkdirAll(dbpath, 0o755); err != nil {
 		return nil, err
 	}
@@ -778,7 +926,7 @@ func launchMongod(t *Topology, st *State, name string, port int, dbpath, replSet
 	logPath := filepath.Join(instDir, "mongod.log")
 	confPath := filepath.Join(instDir, "mongod.conf")
 
-	conf := mongodConf(t, name, dbpath, logPath, port, replSet, clusterRole)
+	conf := mongodConf(t, name, dbpath, logPath, port, replSet, clusterRole, mongotAddr)
 	if err := os.WriteFile(confPath, []byte(conf), 0o644); err != nil {
 		return nil, err
 	}
@@ -787,7 +935,7 @@ func launchMongod(t *Topology, st *State, name string, port int, dbpath, replSet
 	return spawn(t.BinDir, st, "mongod", name, port, dbpath, logPath, confPath, args, t.Verbose)
 }
 
-func launchMongos(t *Topology, st *State, name string, port int, configDB string) (*Node, error) {
+func launchMongos(t *Topology, st *State, name string, port int, configDB, mongotAddr string) (*Node, error) {
 	instDir := filepath.Join(t.dir, "data", name)
 	if err := os.MkdirAll(instDir, 0o755); err != nil {
 		return nil, err
@@ -795,7 +943,7 @@ func launchMongos(t *Topology, st *State, name string, port int, configDB string
 	logPath := filepath.Join(instDir, "mongos.log")
 	confPath := filepath.Join(instDir, "mongos.conf")
 
-	conf := mongosConf(t, name, logPath, port, configDB)
+	conf := mongosConf(t, name, logPath, port, configDB, mongotAddr)
 	if err := os.WriteFile(confPath, []byte(conf), 0o644); err != nil {
 		return nil, err
 	}
@@ -1085,17 +1233,11 @@ func StartNode(root, env string, port int, verbose bool) error {
 					filepath.Base(d), n.Name, n.Port, n.PID)
 				return nil
 			}
-			binPath := filepath.Join(st.BinDir, n.Kind)
 			if verbose {
 				fmt.Printf("starting %s (%s) on port %d ...\n", n.Name, n.Kind, n.Port)
-				fmt.Fprintf(os.Stderr, "+ %s %s\n", binPath, strings.Join(n.Args, " "))
 			}
-			cmd := exec.Command(binPath, n.Args...)
-			if err := cmd.Run(); err != nil {
+			if err := launchRecorded(st, n, verbose); err != nil {
 				return fmt.Errorf("start %s: %w (see %s)", n.Name, err, n.LogPath)
-			}
-			if pid, err := waitForPID(n.Port); err == nil {
-				n.PID = pid
 			}
 			st.save(d)
 			fmt.Printf("[%s] started %s on port %d (pid %d)\n",
@@ -1192,18 +1334,11 @@ func Start(envDir string, verbose bool) error {
 				fmt.Printf("%s already running (pid %d)\n", n.Name, n.PID)
 				continue
 			}
-			binPath := filepath.Join(st.BinDir, n.Kind)
-			cmd := exec.Command(binPath, n.Args...)
 			if verbose {
 				fmt.Printf("starting %s (%s) on port %d ...\n", n.Name, n.Kind, n.Port)
-				fmt.Fprintf(os.Stderr, "+ %s %s\n", binPath, strings.Join(n.Args, " "))
 			}
-			if err := cmd.Run(); err != nil {
+			if err := launchRecorded(st, n, verbose); err != nil {
 				return fmt.Errorf("restart %s: %w (see %s)", n.Name, err, n.LogPath)
-			}
-			pid, err := waitForPID(n.Port)
-			if err == nil {
-				n.PID = pid
 			}
 			st.save(envDir) // best effort, keeps PIDs fresh if a later node blocks
 			fmt.Printf("started %s on port %d (pid %d)\n", n.Name, n.Port, n.PID)
@@ -1214,7 +1349,12 @@ func Start(envDir string, verbose bool) error {
 	for _, group := range []func(*Node) bool{
 		func(n *Node) bool { return n.Kind == "mongod" && isConfigSvr(n) },
 		func(n *Node) bool { return n.Kind == "mongod" && !isConfigSvr(n) },
+		// mongos before mongot: a sharded mongot contacts its router
+		// during bootstrap and crashes if it is not reachable. mongod
+		// does not need mongot at startup, so nothing is lost by
+		// starting search last.
 		func(n *Node) bool { return n.Kind == "mongos" },
+		func(n *Node) bool { return n.Kind == "mongot" },
 	} {
 		if err := relaunch(group); err != nil {
 			return err
@@ -1227,6 +1367,13 @@ func Start(envDir string, verbose bool) error {
 func nodeRole(n *Node) string {
 	if n.Kind == "mongos" {
 		return "router"
+	}
+	// mongot speaks gRPC, not the wire protocol: ask its health endpoint.
+	if n.Kind == "mongot" {
+		if mongotHealthy(n) {
+			return "search"
+		}
+		return "starting"
 	}
 	c, err := mongo.Dial(hostPort(n.Port), 2*time.Second)
 	if err != nil {
@@ -1281,6 +1428,10 @@ func colorRole(r string) string {
 		return table.Magenta(r)
 	case "router":
 		return table.Blue(r)
+	case "search":
+		return table.Bold(table.Blue(r))
+	case "starting":
+		return table.Yellow(r)
 	case "standalone":
 		return table.Cyan(r)
 	case "-":

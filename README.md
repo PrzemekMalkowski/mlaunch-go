@@ -19,6 +19,12 @@ automatically download matching binaries for recent MongoDB versions
   `--mongos`)
 - `--auth` support: keyfile-based internal auth plus a default
   `mlaunch` / `pa33word` root user (created via the localhost exception)
+- `--percona-search`: launches [Percona Search for MongoDB](https://github.com/percona/percona-mongot)
+  (`mongot`) next to the servers, so `$search` / `$vectorSearch` work in the
+  sandbox. One mongot per replica set, one per shard; the tarball bundles its
+  own OpenJDK, so no JVM is needed on the host. Implies `--distro percona`,
+  `--replicaset` and `--auth`, and requires Percona Server for MongoDB 8.3+
+  (both are Technical Preview releases at the time of writing)
 - Automatic binary download:
   - **MongoDB Community** from `fastdl.mongodb.org`, picking the tarball
     variant matching the host distro/arch (e.g. Ubuntu 24.04 x86_64 →
@@ -33,7 +39,7 @@ automatically download matching binaries for recent MongoDB versions
   and reused on subsequent runs
 - `show-repo` lists the versions available for download (MongoDB release
   catalog and Percona GitHub tags), marking which have a build for your host
-  and which are already downloaded
+  and which are already downloaded; `--distro search` lists mongot releases
 - No shell required: replica set initiation, primary election waits,
   `addShard`, user creation and SCRAM-SHA-256 authentication are done over a
   built-in minimal OP_MSG/BSON client — the modern server tarballs no longer
@@ -102,8 +108,16 @@ Requires Go ≥ 1.22. No third-party modules (stdlib only), so it builds offline
 ./mlaunch-go init --dry-run --version 8.3.4
 ./mlaunch-go init --dry-run --distro percona --version 8.0.4
 
+# Percona Search: a 3-node replica set with mongot (auth is implied)
+./mlaunch-go init --percona-search --version 8.3.7-1
+
+# ... or one mongot per shard
+./mlaunch-go init --percona-search --sharded 2 --nodes 3 --version 8.3.7-1
+
 # What's available to download?
 ./mlaunch-go show-repo --major 8.0 --stable yes
+./mlaunch-go show-repo --distro percona --major 8.3
+./mlaunch-go show-repo --distro search
 
 # Manage the environments
 ./mlaunch-go list
@@ -153,8 +167,58 @@ sandboxes/
 
 Everything binds to `127.0.0.1` only.
 
+With `--percona-search` the environment is named `<topology>-<members>n-<version>-search`
+and gains a mongot per replica set (or per shard):
+
+```
+sandboxes/
+└── replicaset-3n-8.3.7-1-search/
+    ├── .mlaunch_startup.json
+    ├── keyfile
+    ├── mongot.pwd                 # password of the searchCoordinator user
+    └── data/
+        ├── replset/rs1/...        # mongod members, as above
+        └── mongot/
+            ├── index/             # storage.dataPath (Lucene indexes)
+            ├── mongot.yml         # editable; applied on next 'start'
+            └── mongot.log
+```
+
+mongod members are given `mongotHost` / `searchIndexManagementHostAndPort`
+at startup; the mongot ports are allocated at the end of the environment's
+port span, so enabling search does not shift the server ports.
+
+Each mongot instance listens on three consecutive ports — all of them show up
+in `netstat` as the same JVM process:
+
+| Offset | Purpose | `mongot.yml` key |
+| --- | --- | --- |
+| +0 | gRPC; the endpoint mongod's `mongotHost` / `searchIndexManagementHostAndPort` point at | `server.grpc.address` |
+| +1 | HTTP health check (`GET /health` → `SERVING`), polled by `init` and `mlaunch-go list` | `healthCheck.address` |
+| +2 | HTTP metrics (Prometheus-style scrape endpoint; unused by mlaunch-go) | `metrics.address` |
+
+So a mongot reported as `ready on port 28310 (health 28311, metrics 28312)`
+owns 28310–28312. The metrics listener can be turned off by setting
+`metrics.enabled: false` in `mongot.yml` and restarting; the port stays
+reserved either way, so the layout does not change.
+
+In a sharded cluster there is one mongot per shard, and its `mongot.yml`
+additionally carries a `syncSource.router` block pointing at the first
+mongos: mongot verifies at bootstrap that its config matches the real
+topology and refuses to start on a shard without a router configured.
+Because of that the mongots are launched last, after the routers are up and
+`addShard` has run, and the `mongot` replication user is created twice —
+once on each shard primary (for replication) and once through mongos (for
+the router connection, since cluster users live on the config servers).
+
+mongot keeps its indexes in memory where it can and wants
+at least 4 GB of RAM per process — `init` warns before launching if the host
+looks too small.
+
 ## Not yet implemented (vs. mlaunch)
 
+- TLS between mongod and mongot (`searchTLSMode` is set to `disabled`)
+- search index creation (`createSearchIndexes`) — indexes are yours to create
 - x.509 / TLS options
 - hidden/priority member options
 - `mlaunch restart` (use `stop` + `start`)
