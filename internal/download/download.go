@@ -73,6 +73,9 @@ func Resolve(opts Options, host *platform.Info) ([]string, error) {
 	case DistPercona:
 		return perconaCandidates(opts.Version, host)
 
+	case DistSearch:
+		return nil, fmt.Errorf("%q is the search component, not a server distribution; launch it with 'init --percona-search' or list versions with 'show-repo --distro search'", DistSearch)
+
 	default:
 		return nil, fmt.Errorf("unknown distribution %q (want %q or %q)", opts.Dist, DistMongoDB, DistPercona)
 	}
@@ -222,7 +225,7 @@ func Fetch(opts Options, host *platform.Info) (*Result, error) {
 }
 
 func extractResult(url, archive, dir string, quiet bool) (*Result, error) {
-	binDir, err := extractTarGz(archive, dir, quiet)
+	binDir, err := extractTarGz(archive, dir, filepath.Join("bin", "mongod"), "", quiet)
 	if err != nil {
 		return nil, err
 	}
@@ -288,9 +291,14 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // extractTarGz unpacks archive into destDir and returns the path to the
 // top-level directory of the tarball (e.g. mongodb-linux-x86_64-ubuntu2204-8.3.4).
-// If that directory already exists with a bin/mongod inside, extraction is
-// skipped.
-func extractTarGz(archive, destDir string, quiet bool) (string, error) {
+//
+// marker is a path relative to that top-level directory whose presence
+// means the archive is already unpacked and extraction can be skipped
+// (e.g. "bin/mongod" for a server tarball, "mongot" for Percona Search).
+// guessName overrides the top-level directory name for that check; it is
+// needed for archives whose top-level directory does not match the archive
+// name. An empty guessName derives the name from the archive.
+func extractTarGz(archive, destDir, marker, guessName string, quiet bool) (string, error) {
 	// Work with an absolute destination path. This is required for the
 	// escape check below: with a relative destDir like ".",
 	// filepath.Join(".", name) strips the leading "./", so the prefix
@@ -301,12 +309,15 @@ func extractTarGz(archive, destDir string, quiet bool) (string, error) {
 	}
 	destDir = absDest
 
-	// Guess the top-level dir from the archive name to allow skipping.
-	base := filepath.Base(archive)
-	base = strings.TrimSuffix(base, ".tgz")
-	base = strings.TrimSuffix(base, ".tar.gz")
-	guess := filepath.Join(destDir, base)
-	if _, err := os.Stat(filepath.Join(guess, "bin", "mongod")); err == nil {
+	// Guess the top-level dir to allow skipping.
+	name := guessName
+	if name == "" {
+		name = filepath.Base(archive)
+		name = strings.TrimSuffix(name, ".tgz")
+		name = strings.TrimSuffix(name, ".tar.gz")
+	}
+	guess := filepath.Join(destDir, name)
+	if _, err := os.Stat(filepath.Join(guess, marker)); err == nil {
 		if !quiet {
 			fmt.Fprintf(os.Stderr, "reusing extracted binaries in %s\n", guess)
 		}
