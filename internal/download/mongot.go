@@ -36,8 +36,12 @@ type MongotOptions struct {
 	DownloadDir string
 	// URL, when non-empty, skips resolution entirely.
 	URL string
-	// Quiet suppresses progress output.
+	// Quiet suppresses the plain-text fallback output on stderr. It has no
+	// effect on Progress, which is always called when set.
 	Quiet bool
+	// Progress, when set, receives events as the download advances; see
+	// Options.Progress.
+	Progress func(Event)
 }
 
 // ResolveMongot computes the tarball URL for the given options on the given
@@ -55,6 +59,9 @@ func ResolveMongot(opts MongotOptions, host *platform.Info) (string, error) {
 	v, err := mongotTarballVersion(opts.Version)
 	if err != nil {
 		return "", err
+	}
+	if host.OS != "linux" {
+		return "", fmt.Errorf("Percona Search for MongoDB is published for Linux only, not %s", host.OS)
 	}
 	switch host.Arch {
 	case "x86_64", "aarch64":
@@ -107,11 +114,14 @@ func FetchMongot(opts MongotOptions, host *platform.Info) (*Result, error) {
 	}
 
 	local := filepath.Join(dir, filepath.Base(url))
+	archiveCached := false
 	if st, err := os.Stat(local); err == nil && st.Size() > 0 {
+		archiveCached = true
 		if !opts.Quiet {
 			fmt.Fprintf(os.Stderr, "reusing existing archive %s\n", local)
 		}
-	} else if err := downloadFile(url, local, opts.Quiet); err != nil {
+		notify(opts.Progress, Event{Phase: PhaseReuse, URL: url, Path: local, Done: st.Size(), Total: st.Size()})
+	} else if err := downloadFile(url, local, opts.Quiet, opts.Progress); err != nil {
 		return nil, err
 	}
 
@@ -119,14 +129,20 @@ func FetchMongot(opts MongotOptions, host *platform.Info) (*Result, error) {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return nil, err
 	}
-	binDir, err := extractTarGz(local, destDir, mongotLauncher, "percona-search-mongodb", opts.Quiet)
+	binDir, binCached, err := extractTarGz(local, destDir, mongotLauncher, "percona-search-mongodb", opts.Quiet, opts.Progress)
 	if err != nil {
 		return nil, err
 	}
 	if err := ValidateMongotDir(binDir); err != nil {
 		return nil, err
 	}
-	return &Result{URL: url, Archive: local, BinDir: binDir}, nil
+	return &Result{
+		URL:           url,
+		Archive:       local,
+		BinDir:        binDir,
+		ArchiveCached: archiveCached,
+		BinCached:     binCached,
+	}, nil
 }
 
 // ValidateMongotDir checks that dir looks like an extracted Percona Search

@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -14,9 +15,11 @@ import (
 
 // Info describes the host platform.
 type Info struct {
-	OS         string // "linux" (only linux is supported for now)
-	Arch       string // "x86_64" or "aarch64"
-	DistroID   string // e.g. "ubuntu", "rhel", "centos", "debian", "amzn", "ol", "rocky", "almalinux"
+	OS string // "linux" or "macos"
+	// Arch follows the naming of the tarballs for OS: "x86_64" or
+	// "aarch64" on Linux, "x86_64" or "arm64" on macOS.
+	Arch       string
+	DistroID   string // e.g. "ubuntu", "rhel", "centos", "debian", "amzn", "ol", "rocky", "almalinux"; "macos" on macOS
 	VersionID  string // e.g. "24.04", "9.3"
 	Codename   string // e.g. "noble", "jammy" (Ubuntu/Debian)
 	IDLike     string // contents of ID_LIKE, e.g. "rhel fedora"
@@ -25,10 +28,16 @@ type Info struct {
 
 // Detect inspects the running host.
 func Detect() (*Info, error) {
-	if runtime.GOOS != "linux" {
-		return nil, fmt.Errorf("unsupported OS %q: mlaunch-go currently supports Linux only", runtime.GOOS)
+	switch runtime.GOOS {
+	case "linux":
+		return detectLinux()
+	case "darwin":
+		return detectMacOS()
 	}
+	return nil, fmt.Errorf("unsupported OS %q: mlaunch-go supports Linux and macOS", runtime.GOOS)
+}
 
+func detectLinux() (*Info, error) {
 	info := &Info{OS: "linux"}
 
 	switch runtime.GOARCH {
@@ -43,6 +52,28 @@ func Detect() (*Info, error) {
 	if err := info.readOSRelease("/etc/os-release"); err != nil {
 		return nil, fmt.Errorf("cannot detect Linux distribution: %w", err)
 	}
+	return info, nil
+}
+
+// detectMacOS describes a macOS host. Only MongoDB Community publishes
+// macOS tarballs, and they are not split by OS release, so the version is
+// informational only.
+func detectMacOS() (*Info, error) {
+	info := &Info{OS: "macos", DistroID: "macos"}
+
+	switch runtime.GOARCH {
+	case "amd64":
+		info.Arch = "x86_64"
+	case "arm64":
+		info.Arch = "arm64"
+	default:
+		return nil, fmt.Errorf("unsupported CPU architecture %q", runtime.GOARCH)
+	}
+
+	if out, err := exec.Command("sw_vers", "-productVersion").Output(); err == nil {
+		info.VersionID = strings.TrimSpace(string(out))
+	}
+	info.PrettyName = strings.TrimSpace("macOS " + info.VersionID)
 	return info, nil
 }
 
@@ -129,8 +160,17 @@ func (i *Info) ubuntuNum() int {
 // fallback. The caller is expected to probe them in order, because not
 // every MongoDB release has a build for every distro release (e.g. some
 // 8.x releases ship ubuntu2204 but not ubuntu2404 tarballs).
+//
+// On macOS there is a single build per architecture ("macos"); releases up
+// to 4.0 were published for x86_64 only, as "osx-ssl".
 func (i *Info) MongoDBVariantCandidates() ([]string, error) {
 	switch {
+	case i.OS == "macos":
+		if i.Arch == "x86_64" {
+			return []string{"macos", "osx-ssl"}, nil
+		}
+		return []string{"macos"}, nil
+
 	case i.DistroID == "ubuntu":
 		known := []int{2404, 2204, 2004, 1804, 1604}
 		host := i.ubuntuNum()
@@ -192,6 +232,9 @@ func (i *Info) MongoDBVariantCandidates() ([]string, error) {
 //	percona-server-mongodb-8.0.4-1-x86_64.jammy-minimal.tar.gz
 func (i *Info) PerconaFlavorCandidates() ([]string, error) {
 	switch {
+	case i.OS == "macos":
+		return nil, fmt.Errorf("Percona Server for MongoDB is not published for macOS; use --distro mongodb (MongoDB Community), or --binary-dir with your own build")
+
 	case i.DistroID == "ubuntu":
 		// Map release number to codename, newest first, filtered to <= host.
 		type rel struct {

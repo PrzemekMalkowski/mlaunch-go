@@ -24,6 +24,28 @@ const (
 	DistPercona Distribution = "percona"
 )
 
+// Phase names the stage a Fetch is currently in; it is reported through
+// Options.Progress so callers can drive a progress display.
+type Phase string
+
+const (
+	PhaseProbe    Phase = "probe"    // looking for a URL that exists
+	PhaseDownload Phase = "download" // transferring the tarball
+	PhaseExtract  Phase = "extract"  // unpacking the tarball
+	PhaseReuse    Phase = "reuse"    // found locally, nothing to do
+)
+
+// Event reports progress of a Fetch. Done/Total are bytes during
+// PhaseDownload and candidate counts during PhaseProbe; Total is 0 when
+// the size is unknown.
+type Event struct {
+	Phase Phase
+	Done  int64
+	Total int64
+	URL   string // the URL being probed/downloaded, when relevant
+	Path  string // the local archive or directory, when relevant
+}
+
 // Options controls the resolution/download.
 type Options struct {
 	Dist    Distribution
@@ -32,8 +54,20 @@ type Options struct {
 	DownloadDir string
 	// URL, when non-empty, skips resolution entirely.
 	URL string
-	// Quiet suppresses progress output.
+	// Quiet suppresses the plain-text fallback output on stderr. It has no
+	// effect on Progress, which is always called when set.
 	Quiet bool
+	// Progress, when set, receives events as the download advances. It is
+	// called from the goroutine driving Fetch, frequently during
+	// PhaseDownload, and must not block for long.
+	Progress func(Event)
+}
+
+// notify reports an event when the caller asked for them.
+func notify(fn func(Event), ev Event) {
+	if fn != nil {
+		fn(ev)
+	}
 }
 
 // Result describes a completed download.
@@ -41,6 +75,13 @@ type Result struct {
 	URL     string
 	Archive string // path of the downloaded tarball
 	BinDir  string // extracted directory containing mongod / mongos
+	// ArchiveCached is true when the tarball was already in the download
+	// directory, so nothing was transferred.
+	ArchiveCached bool
+	// BinCached is true when the extracted directory was already present,
+	// so nothing was unpacked. ArchiveCached && BinCached means the
+	// binaries were ready to use before this call.
+	BinCached bool
 }
 
 var httpClient = &http.Client{Timeout: 10 * time.Minute}
@@ -63,10 +104,7 @@ func Resolve(opts Options, host *platform.Info) ([]string, error) {
 		}
 		urls := make([]string, 0, len(variants))
 		for _, v := range variants {
-			// e.g. https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-8.3.4.tgz
-			urls = append(urls, fmt.Sprintf(
-				"https://fastdl.mongodb.org/linux/mongodb-linux-%s-%s-%s.tgz",
-				host.Arch, v, opts.Version))
+			urls = append(urls, mongoDBTarballURL(host, v, opts.Version))
 		}
 		return urls, nil
 
@@ -79,6 +117,20 @@ func Resolve(opts Options, host *platform.Info) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("unknown distribution %q (want %q or %q)", opts.Dist, DistMongoDB, DistPercona)
 	}
+}
+
+// mongoDBTarballURL builds a community tarball URL. The variant comes
+// after the architecture on Linux and before it on macOS:
+//
+//	https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-8.3.4.tgz
+//	https://fastdl.mongodb.org/osx/mongodb-macos-arm64-8.0.34.tgz
+func mongoDBTarballURL(host *platform.Info, variant, version string) string {
+	if host.OS == "macos" {
+		return fmt.Sprintf("https://fastdl.mongodb.org/osx/mongodb-%s-%s-%s.tgz",
+			variant, host.Arch, version)
+	}
+	return fmt.Sprintf("https://fastdl.mongodb.org/linux/mongodb-linux-%s-%s-%s.tgz",
+		host.Arch, variant, version)
 }
 
 // perconaCandidates builds URLs of the form:
@@ -128,9 +180,11 @@ func perconaCandidates(version string, host *platform.Info) ([]string, error) {
 
 // probe returns the first URL from candidates that exists (HTTP 200 on HEAD,
 // falling back to a ranged GET for servers that reject HEAD).
-func probe(candidates []string, quiet bool) (string, error) {
+func probe(candidates []string, quiet bool, progress func(Event)) (string, error) {
 	var lastErr error
-	for _, u := range candidates {
+	total := int64(len(candidates))
+	for i, u := range candidates {
+		notify(progress, Event{Phase: PhaseProbe, Done: int64(i + 1), Total: total, URL: u})
 		ok, err := urlExists(u)
 		if err != nil {
 			lastErr = err
@@ -200,7 +254,8 @@ func Fetch(opts Options, host *platform.Info) (*Result, error) {
 			if !opts.Quiet {
 				fmt.Fprintf(os.Stderr, "reusing existing archive %s\n", local)
 			}
-			return extractResult(u, local, dir, opts.Quiet)
+			notify(opts.Progress, Event{Phase: PhaseReuse, URL: u, Path: local, Done: st.Size(), Total: st.Size()})
+			return extractResult(u, local, dir, true, opts)
 		}
 	}
 
@@ -211,28 +266,34 @@ func Fetch(opts Options, host *platform.Info) (*Result, error) {
 		if !opts.Quiet {
 			fmt.Fprintf(os.Stderr, "resolving tarball for %s ...\n", host)
 		}
-		chosen, err = probe(candidates, opts.Quiet)
+		chosen, err = probe(candidates, opts.Quiet, opts.Progress)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	local := filepath.Join(dir, filepath.Base(chosen))
-	if err := downloadFile(chosen, local, opts.Quiet); err != nil {
+	if err := downloadFile(chosen, local, opts.Quiet, opts.Progress); err != nil {
 		return nil, err
 	}
-	return extractResult(chosen, local, dir, opts.Quiet)
+	return extractResult(chosen, local, dir, false, opts)
 }
 
-func extractResult(url, archive, dir string, quiet bool) (*Result, error) {
-	binDir, err := extractTarGz(archive, dir, filepath.Join("bin", "mongod"), "", quiet)
+func extractResult(url, archive, dir string, archiveCached bool, opts Options) (*Result, error) {
+	binDir, reused, err := extractTarGz(archive, dir, filepath.Join("bin", "mongod"), "", opts.Quiet, opts.Progress)
 	if err != nil {
 		return nil, err
 	}
-	return &Result{URL: url, Archive: archive, BinDir: binDir}, nil
+	return &Result{
+		URL:           url,
+		Archive:       archive,
+		BinDir:        binDir,
+		ArchiveCached: archiveCached,
+		BinCached:     reused,
+	}, nil
 }
 
-func downloadFile(url, dest string, quiet bool) error {
+func downloadFile(url, dest string, quiet bool, progress func(Event)) error {
 	if !quiet {
 		fmt.Fprintf(os.Stderr, "downloading %s\n", url)
 	}
@@ -251,13 +312,24 @@ func downloadFile(url, dest string, quiet bool) error {
 		return err
 	}
 
+	// A caller-supplied hook takes over the display; otherwise fall back
+	// to the plain \r counter on stderr (verbose mode).
+	stderrProgress := progress == nil && !quiet && resp.ContentLength > 0
+	notify(progress, Event{Phase: PhaseDownload, Total: resp.ContentLength, URL: url, Path: dest})
 	var src io.Reader = resp.Body
-	if !quiet && resp.ContentLength > 0 {
-		src = &progressReader{r: resp.Body, total: resp.ContentLength}
+	if progress != nil || stderrProgress {
+		src = &progressReader{
+			r:        resp.Body,
+			total:    resp.ContentLength,
+			url:      url,
+			dest:     dest,
+			progress: progress,
+			stderr:   stderrProgress,
+		}
 	}
 	_, cerr := io.Copy(f, src)
 	closeErr := f.Close()
-	if !quiet {
+	if stderrProgress {
 		fmt.Fprintln(os.Stderr)
 	}
 	if cerr != nil {
@@ -271,26 +343,48 @@ func downloadFile(url, dest string, quiet bool) error {
 	return os.Rename(tmp, dest)
 }
 
+// progressReader reports transfer progress while the body is copied.
+// Updates are throttled so that a fast link does not spend its time
+// formatting output.
 type progressReader struct {
-	r     io.Reader
-	total int64
-	done  int64
-	last  time.Time
+	r        io.Reader
+	total    int64
+	done     int64
+	last     time.Time
+	url      string
+	dest     string
+	progress func(Event)
+	stderr   bool // use the plain \r counter instead of progress
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
 	n, err := p.r.Read(b)
 	p.done += int64(n)
-	if time.Since(p.last) > 500*time.Millisecond || err == io.EOF {
-		p.last = time.Now()
-		fmt.Fprintf(os.Stderr, "\r  %d / %d MiB (%d%%)",
-			p.done>>20, p.total>>20, p.done*100/p.total)
+	if time.Since(p.last) < 100*time.Millisecond && err != io.EOF {
+		return n, err
 	}
+	p.last = time.Now()
+	if p.stderr {
+		if p.total > 0 {
+			fmt.Fprintf(os.Stderr, "\r  %d / %d MiB (%d%%)",
+				p.done>>20, p.total>>20, p.done*100/p.total)
+		}
+		return n, err
+	}
+	notify(p.progress, Event{
+		Phase: PhaseDownload,
+		Done:  p.done,
+		Total: p.total,
+		URL:   p.url,
+		Path:  p.dest,
+	})
 	return n, err
 }
 
 // extractTarGz unpacks archive into destDir and returns the path to the
-// top-level directory of the tarball (e.g. mongodb-linux-x86_64-ubuntu2204-8.3.4).
+// top-level directory of the tarball (e.g. mongodb-linux-x86_64-ubuntu2204-8.3.4)
+// together with a flag telling whether the archive was already unpacked
+// and extraction was skipped.
 //
 // marker is a path relative to that top-level directory whose presence
 // means the archive is already unpacked and extraction can be skipped
@@ -298,14 +392,14 @@ func (p *progressReader) Read(b []byte) (int, error) {
 // guessName overrides the top-level directory name for that check; it is
 // needed for archives whose top-level directory does not match the archive
 // name. An empty guessName derives the name from the archive.
-func extractTarGz(archive, destDir, marker, guessName string, quiet bool) (string, error) {
+func extractTarGz(archive, destDir, marker, guessName string, quiet bool, progress func(Event)) (string, bool, error) {
 	// Work with an absolute destination path. This is required for the
 	// escape check below: with a relative destDir like ".",
 	// filepath.Join(".", name) strips the leading "./", so the prefix
 	// comparison would wrongly flag every entry as escaping.
 	absDest, err := filepath.Abs(destDir)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	destDir = absDest
 
@@ -316,32 +410,45 @@ func extractTarGz(archive, destDir, marker, guessName string, quiet bool) (strin
 		name = strings.TrimSuffix(name, ".tgz")
 		name = strings.TrimSuffix(name, ".tar.gz")
 	}
-	guess := filepath.Join(destDir, name)
-	if _, err := os.Stat(filepath.Join(guess, marker)); err == nil {
-		if !quiet {
-			fmt.Fprintf(os.Stderr, "reusing extracted binaries in %s\n", guess)
+	guesses := []string{filepath.Join(destDir, name)}
+	// Some archives unpack into a directory that does not match their
+	// name (mongodb-macos-arm64-8.0.34.tgz holds mongodb-macos-aarch64--8.0.34/),
+	// so also look where the archive's first entry would go.
+	if guessName == "" {
+		if top, err := archiveTopLevel(archive); err == nil && top != name {
+			guesses = append(guesses, filepath.Join(destDir, top))
 		}
-		return guess, nil
+	}
+	for _, guess := range guesses {
+		if _, err := os.Stat(filepath.Join(guess, marker)); err == nil {
+			if !quiet {
+				fmt.Fprintf(os.Stderr, "reusing extracted binaries in %s\n", guess)
+			}
+			notify(progress, Event{Phase: PhaseReuse, Path: guess})
+			return guess, true, nil
+		}
 	}
 
 	f, err := os.Open(archive)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", archive, err)
+		return "", false, fmt.Errorf("%s: %w", archive, err)
 	}
 	defer gz.Close()
 
 	if !quiet {
 		fmt.Fprintf(os.Stderr, "extracting %s ...\n", archive)
 	}
+	notify(progress, Event{Phase: PhaseExtract, Path: archive})
 
 	tr := tar.NewReader(gz)
 	topLevel := ""
+	var extracted int64
 
 	for {
 		hdr, err := tr.Next()
@@ -349,7 +456,7 @@ func extractTarGz(archive, destDir, marker, guessName string, quiet bool) (strin
 			break
 		}
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 
 		name := filepath.Clean(hdr.Name)
@@ -358,7 +465,7 @@ func extractTarGz(archive, destDir, marker, guessName string, quiet bool) (strin
 		}
 		target := filepath.Join(destDir, name)
 		if target != destDir && !strings.HasPrefix(target, destDir+string(os.PathSeparator)) {
-			return "", fmt.Errorf("tar entry escapes destination: %s", hdr.Name)
+			return "", false, fmt.Errorf("tar entry escapes destination: %s", hdr.Name)
 		}
 		if topLevel == "" {
 			first := strings.SplitN(name, string(os.PathSeparator), 2)[0]
@@ -368,36 +475,69 @@ func extractTarGz(archive, destDir, marker, guessName string, quiet bool) (strin
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {
-				return "", err
+				return "", false, err
 			}
 		case tar.TypeSymlink:
 			os.Remove(target)
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return "", err
+				return "", false, err
 			}
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				return "", err
+				return "", false, err
 			}
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return "", err
+				return "", false, err
 			}
 			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			if _, err := io.Copy(out, tr); err != nil {
 				out.Close()
-				return "", err
+				return "", false, err
 			}
 			if err := out.Close(); err != nil {
-				return "", err
+				return "", false, err
+			}
+			extracted++
+			if extracted%200 == 0 {
+				notify(progress, Event{Phase: PhaseExtract, Done: extracted, Path: archive})
 			}
 		}
 	}
 
 	if topLevel == "" {
-		return "", fmt.Errorf("archive %s appears to be empty", archive)
+		return "", false, fmt.Errorf("archive %s appears to be empty", archive)
 	}
-	return topLevel, nil
+	return topLevel, false, nil
+}
+
+// archiveTopLevel returns the top-level directory name of a .tar.gz
+// archive, read from its first entry without unpacking anything.
+func archiveTopLevel(archive string) (string, error) {
+	f, err := os.Open(archive)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", err
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			return "", err
+		}
+		name := filepath.Clean(hdr.Name)
+		if name == "." || strings.HasPrefix(name, "..") {
+			continue
+		}
+		return strings.SplitN(name, string(os.PathSeparator), 2)[0], nil
+	}
 }

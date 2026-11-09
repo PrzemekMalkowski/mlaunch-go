@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/PrzemekMalkowski/mlaunch-go/internal/cluster"
 	"github.com/PrzemekMalkowski/mlaunch-go/internal/download"
@@ -22,7 +23,24 @@ import (
 
 // version is the tool version, shown by 'mlaunch-go version'.
 // version is set at build time by goreleaser via -ldflags.
-var version = "0.2.0"
+var version = "0.2.1"
+
+// Sandboxes and downloads live under $HOME/mongodb-sandboxes by default,
+// so the tool behaves the same whatever directory it is run from.
+var (
+	defaultSandboxDir  = filepath.Join(defaultBaseDir(), "sandboxes")
+	defaultDownloadDir = filepath.Join(defaultBaseDir(), "downloads")
+)
+
+// defaultBaseDir returns $HOME/mongodb-sandboxes, or the current directory
+// when the home directory cannot be determined.
+func defaultBaseDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return filepath.Join(home, "mongodb-sandboxes")
+}
 
 const usage = `mlaunch-go — launch sandbox MongoDB environments (Go rewrite of mlaunch)
 
@@ -57,7 +75,8 @@ show-repo options:
                         Percona Search / mongot releases)
   --major M             filter by major version, e.g. --major 8 or --major 8.0
   --stable yes|no       only production releases (yes) or only rc/dev builds (no)
-  --download-dir DIR    where downloads are detected (default "downloads")
+  --download-dir DIR    where downloads are detected
+                        (default "$HOME/mongodb-sandboxes/downloads")
 
 init options:
   --single              launch a single standalone mongod (default)
@@ -72,15 +91,19 @@ init options:
   --percona-search      run Percona Search (mongot) alongside the servers for
                         $search / $vectorSearch; implies --distro percona,
                         --replicaset and --auth, and needs PSMDB 8.3 or later
+                        (Linux only)
   --port PORT           base port (default: derived from version)
-  --dir ROOT            sandboxes root directory (default "./sandboxes")
+  --dir ROOT            sandboxes root directory
+                        (default "$HOME/mongodb-sandboxes/sandboxes")
 
 binary resolution (in priority order):
   --binary-dir DIR      use existing mongod/mongos binaries from DIR (no download)
   --url URL             download this exact tarball URL
   --version X.Y.Z       version to download (required unless --binary-dir/--url)
   --distro NAME         "mongodb" (community, default) or "percona"
-  --download-dir DIR    where tarballs are downloaded/extracted (default "downloads")
+                        (Percona builds are Linux-only)
+  --download-dir DIR    where tarballs are downloaded/extracted
+                        (default "$HOME/mongodb-sandboxes/downloads")
   --search-version V    Percona Search (mongot) version (default 1.70.3)
   --search-binary-dir D use an existing extracted Percona Search directory
   --search-url URL      download this exact mongot tarball
@@ -200,13 +223,13 @@ func cmdInit(args []string) error {
 	mongos := fs.Int("mongos", 1, "")
 	auth := fs.Bool("auth", false, "")
 	port := fs.Int("port", 0, "")
-	dir := fs.String("dir", "./sandboxes", "")
+	dir := fs.String("dir", defaultSandboxDir, "")
 
 	binaryDir := fs.String("binary-dir", "", "")
 	rawURL := fs.String("url", "", "")
 	version := fs.String("version", "", "")
 	distro := fs.String("distro", "mongodb", "")
-	downloadDir := fs.String("download-dir", "downloads", "")
+	downloadDir := fs.String("download-dir", defaultDownloadDir, "")
 
 	search := fs.Bool("percona-search", false, "")
 	searchVersion := fs.String("search-version", download.DefaultSearchVersion, "")
@@ -229,6 +252,9 @@ func cmdInit(args []string) error {
 	explicit := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 	if *search {
+		if runtime.GOOS != "linux" {
+			return fmt.Errorf("--percona-search is only available on Linux: Percona Server for MongoDB and Percona Search are not published for %s", runtime.GOOS)
+		}
 		if explicit["distro"] && *distro != string(download.DistPercona) {
 			return fmt.Errorf("--percona-search requires --distro percona (mongot needs Percona Server for MongoDB 8.3 or later)")
 		}
@@ -283,12 +309,23 @@ func cmdInit(args []string) error {
 			return nil
 		}
 
+		label := serverLabel(download.Distribution(*distro), *version)
+		step := table.StartStep("Downloading %s...", label)
+		opts.Progress = downloadReporter(step, label)
+
 		res, err := download.Fetch(opts, host)
 		if err != nil {
+			step.Fail("Could not download %s", label)
 			return err
 		}
-		fmt.Printf("using binaries from %s\n", res.BinDir)
+		if res.ArchiveCached && res.BinCached {
+			step.Skip("%s already downloaded (%s)", label, res.BinDir)
+		} else {
+			step.Done("%s ready (%s)", label, res.BinDir)
+		}
 		binDir = filepath.Join(res.BinDir, "bin")
+	} else {
+		table.StepSkip("Using mongod/mongos from %s (no download)", binDir)
 	}
 
 	// Percona Search binaries. Unlike the server tarballs there is
@@ -300,22 +337,33 @@ func cmdInit(args []string) error {
 		if err != nil {
 			return err
 		}
+		label := "Percona Search for MongoDB (mongot) " + *searchVersion
+		step := table.StartStep("Downloading %s...", label)
 		res, err := download.FetchMongot(download.MongotOptions{
 			Version:     *searchVersion,
 			DownloadDir: *downloadDir,
 			URL:         *searchURL,
 			Quiet:       !*verbose,
+			Progress:    downloadReporter(step, label),
 		}, host)
 		if err != nil {
+			step.Fail("Could not download %s", label)
 			return err
 		}
-		fmt.Printf("using Percona Search binaries from %s\n", res.BinDir)
+		if res.ArchiveCached && res.BinCached {
+			step.Skip("%s already downloaded (%s)", label, res.BinDir)
+		} else {
+			step.Done("%s ready (%s)", label, res.BinDir)
+		}
 		searchBin = res.BinDir
 	}
 	absSearchBin := ""
 	if searchBin != "" {
 		if err := download.ValidateMongotDir(searchBin); err != nil {
 			return err
+		}
+		if *searchBinaryDir != "" {
+			table.StepSkip("Using Percona Search binaries from %s (no download)", searchBin)
 		}
 		abs, err := filepath.Abs(searchBin)
 		if err != nil {
@@ -373,6 +421,65 @@ func cmdInit(args []string) error {
 	return err
 }
 
+// serverLabel names the server distribution for progress messages,
+// e.g. "Percona Server for MongoDB 8.3.7-1".
+func serverLabel(dist download.Distribution, version string) string {
+	name := "MongoDB Community Server"
+	if dist == download.DistPercona {
+		name = "Percona Server for MongoDB"
+	}
+	if version == "" {
+		return name
+	}
+	return name + " " + version
+}
+
+// downloadReporter turns download events into live progress on step: the
+// message follows the phase, the dim detail carries candidate counts or
+// transferred bytes.
+func downloadReporter(step *table.Step, label string) func(download.Event) {
+	var (
+		phase      download.Phase
+		phaseStart = time.Now()
+	)
+	return func(ev download.Event) {
+		if ev.Phase != phase {
+			phase, phaseStart = ev.Phase, time.Now()
+			switch phase {
+			case download.PhaseProbe:
+				step.Update("Looking for a %s tarball...", label)
+			case download.PhaseDownload:
+				step.Update("Downloading %s...", label)
+			case download.PhaseExtract:
+				step.Update("Extracting %s...", label)
+			}
+		}
+		switch ev.Phase {
+		case download.PhaseProbe:
+			if ev.Total > 1 {
+				step.Detail("candidate %d/%d", ev.Done, ev.Total)
+			}
+		case download.PhaseDownload:
+			step.Detail("%s", transferText(ev.Done, ev.Total, time.Since(phaseStart)))
+		case download.PhaseReuse:
+			step.Detail("found locally")
+		}
+	}
+}
+
+// transferText renders "142.3 MiB / 280.0 MiB  51%  9.4 MiB/s".
+func transferText(done, total int64, elapsed time.Duration) string {
+	rate := ""
+	if secs := elapsed.Seconds(); secs > 0.5 {
+		rate = "  " + table.HumanBytes(int64(float64(done)/secs)) + "/s"
+	}
+	if total <= 0 {
+		return table.HumanBytes(done) + rate
+	}
+	return fmt.Sprintf("%s / %s  %d%%%s",
+		table.HumanBytes(done), table.HumanBytes(total), done*100/total, rate)
+}
+
 // cmdStart handles 'start'. With --port a single stopped instance is
 // relaunched (searched across all environments under the root unless
 // --env narrows it down); otherwise the whole environment (or all of them
@@ -382,7 +489,7 @@ func cmdInit(args []string) error {
 // a stopped instance reliably.
 func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
-	dir := fs.String("dir", "./sandboxes", "sandboxes root directory")
+	dir := fs.String("dir", defaultSandboxDir, "sandboxes root directory")
 	env := fs.String("env", "", "environment name (subdirectory of the root)")
 	fs.Bool("all", false, "apply to every environment under the root")
 	pid := fs.Int("pid", 0, "not supported for start; use --port")
@@ -416,7 +523,7 @@ func cmdStart(args []string) error {
 // of them with --all) is stopped via the shared cmdEnv path.
 func cmdStop(args []string, kill bool) error {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
-	dir := fs.String("dir", "./sandboxes", "sandboxes root directory")
+	dir := fs.String("dir", defaultSandboxDir, "sandboxes root directory")
 	env := fs.String("env", "", "environment name (subdirectory of the root)")
 	all := fs.Bool("all", false, "apply to every environment under the root")
 	pid := fs.Int("pid", 0, "stop only the instance with this PID")
@@ -454,7 +561,7 @@ func cmdStop(args []string, kill bool) error {
 // --force is given.
 func cmdEnv(args []string, confirmAll bool, fn func(envDir string, verbose bool) error) error {
 	fs := flag.NewFlagSet("cmd", flag.ExitOnError)
-	dir := fs.String("dir", "./sandboxes", "sandboxes root directory")
+	dir := fs.String("dir", defaultSandboxDir, "sandboxes root directory")
 	env := fs.String("env", "", "environment name (subdirectory of the root)")
 	all := fs.Bool("all", false, "apply to every environment under the root")
 	force := fs.Bool("force", false, "with --all: skip the confirmation prompt")
@@ -521,7 +628,7 @@ func cmdEnv(args []string, confirmAll bool, fn func(envDir string, verbose bool)
 
 func cmdList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	dir := fs.String("dir", "./sandboxes", "sandboxes root directory")
+	dir := fs.String("dir", defaultSandboxDir, "sandboxes root directory")
 	env := fs.String("env", "", "only list this environment")
 	noColor := fs.Bool("no-color", false, "disable ANSI colors (colors are also off when piping or with NO_COLOR set)")
 	if err := fs.Parse(args); err != nil {
@@ -542,7 +649,7 @@ func cmdShowRepo(args []string) error {
 	distro := fs.String("distro", "all", "mongodb | percona | search | all")
 	major := fs.String("major", "", "major version filter, e.g. 8 or 8.0")
 	stable := fs.String("stable", "", `stability filter: "yes" (production releases only) or "no" (rc/dev only)`)
-	downloadDir := fs.String("download-dir", "downloads", "where downloads are detected")
+	downloadDir := fs.String("download-dir", defaultDownloadDir, "where downloads are detected")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -575,7 +682,7 @@ func cmdShowRepo(args []string) error {
 		entries = append(entries, mdb...)
 	}
 	if *distro == "all" || *distro == "percona" {
-		psmdb, err := download.ListRemotePercona(*major)
+		psmdb, err := download.ListRemotePercona(host, *major)
 		if err != nil {
 			return err
 		}
@@ -584,7 +691,7 @@ func cmdShowRepo(args []string) error {
 	// Percona Search is versioned independently of the server (1.70.3 vs
 	// 8.3.7-1), so it is listed on request rather than as part of "all".
 	if *distro == "search" {
-		psearch, err := download.ListRemoteSearch(*major)
+		psearch, err := download.ListRemoteSearch(host, *major)
 		if err != nil {
 			return err
 		}
@@ -603,7 +710,7 @@ func cmdShowRepo(args []string) error {
 		if !e.Stable {
 			stableCol = "-"
 		}
-		if e.Dist == download.DistMongoDB && !e.HostBuild {
+		if !e.HostBuild {
 			hostBuild = "-"
 		}
 		if local[download.LocalKey(e.Dist, e.Version)] {

@@ -9,3 +9,4 @@
 *.tar.gz
 .goreleaser
 goreleaser.yaml
+mlaunch-go-repopack.txt

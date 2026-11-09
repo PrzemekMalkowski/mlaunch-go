@@ -8,7 +8,7 @@ A modern, zero-dependency Go rewrite of [`mlaunch`](https://github.com/rueckstie
 from the long-unmaintained mtools suite. It spins up local sandbox MongoDB
 deployments — standalone, replica sets, and sharded clusters — and can
 automatically download matching binaries for recent MongoDB versions
-(including 8.x) or Percona Server for MongoDB.
+(including 8.x) or Percona Server for MongoDB. Runs on Linux and macOS.
 
 ## Features
 
@@ -29,14 +29,17 @@ automatically download matching binaries for recent MongoDB versions
   - **MongoDB Community** from `fastdl.mongodb.org`, picking the tarball
     variant matching the host distro/arch (e.g. Ubuntu 24.04 x86_64 →
     `mongodb-linux-x86_64-ubuntu2404-…` with fallback to `ubuntu2204` etc.,
-    since not every release ships every distro build)
+    since not every release ships every distro build); on macOS the
+    `mongodb-macos-x86_64-…` / `mongodb-macos-arm64-…` tarballs
   - **Percona Server for MongoDB** ("Linux - Generic" minimal tarballs) from
     `downloads.percona.com`, picking `olN` for RHEL-family hosts or the
     Ubuntu/Debian codename (`noble`, `jammy`, `bookworm`, …), e.g.
     `percona-server-mongodb-8.0.4-1-x86_64.ol9-minimal.tar.gz`
 - Candidate URLs are probed with `HEAD` requests, best match first; archives
-  are downloaded to the local folder (`--download-dir`, default `downloads`)
-  and reused on subsequent runs
+  are downloaded to `~/mongodb-sandboxes/downloads` (`--download-dir`) and
+  reused on subsequent runs
+- Environments are created under `~/mongodb-sandboxes/sandboxes` (`--dir`),
+  so every command finds them regardless of the current directory
 - `show-repo` lists the versions available for download (MongoDB release
   catalog and Percona GitHub tags), marking which have a build for your host
   and which are already downloaded; `--distro search` lists mongot releases
@@ -44,6 +47,10 @@ automatically download matching binaries for recent MongoDB versions
   `addShard`, user creation and SCRAM-SHA-256 authentication are done over a
   built-in minimal OP_MSG/BSON client — the modern server tarballs no longer
   bundle a shell, so this keeps things self-contained
+- Every mongod gets a 0.5 GB WiredTiger cache (`storage.wiredTiger.engineConfig.cacheSizeGB`
+  in its `mongod.conf`) instead of the single-instance default of 50% of RAM
+  minus 1 GB, so multi-node sandboxes do not overcommit memory; edit the conf
+  file or pass `-- --wiredTigerCacheSizeGB N` to change it
 - State is persisted to `<envdir>/.mlaunch_startup.json` (analogous to
   mlaunch's `.mlaunch_startup`), enabling `start`/`stop`/`list` later
 
@@ -57,12 +64,19 @@ automatically download matching binaries for recent MongoDB versions
 
 ## Install
 
-Prebuilt Linux binaries (x86_64 and aarch64) are on the
-[releases page](https://github.com/PrzemekMalkowski/mlaunch-go/releases):
+Prebuilt binaries for Linux and macOS (x86_64 and arm64) are on the
+[releases page](https://github.com/PrzemekMalkowski/mlaunch-go/releases).
+Set `OS` to `linux` or `darwin` and `ARCH` to `amd64` or `arm64`:
 
 ```sh
-curl -L https://github.com/PrzemekMalkowski/mlaunch-go/releases/latest/download/mlaunch-go_$(curl -s https://api.github.com/repos/PrzemekMalkowski/mlaunch-go/releases/latest | grep -oP '"tag_name": "v\K[^"]+')_linux_amd64.tar.gz | tar xz mlaunch-go
+OS=linux ARCH=amd64
+VER=$(curl -s https://api.github.com/repos/PrzemekMalkowski/mlaunch-go/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+curl -L https://github.com/PrzemekMalkowski/mlaunch-go/releases/download/v${VER}/mlaunch-go_${VER}_${OS}_${ARCH}.tar.gz | tar xz mlaunch-go
 ```
+
+On macOS, a binary downloaded with a web browser is quarantined by
+Gatekeeper; clear the flag with `xattr -d com.apple.quarantine mlaunch-go`
+(not needed when downloaded with `curl` as above).
 
 Or with Go ≥ 1.22:
 
@@ -99,9 +113,9 @@ Requires Go ≥ 1.22. No third-party modules (stdlib only), so it builds offline
 ./mlaunch-go init --single --distro percona --version 8.0.4-1
 
 # Use binaries you already have; skip downloading
-./mlaunch-go init --replicaset --binary-dir ./mongodb-linux-x86_64-ubuntu2204-8.3.4/bin
+./mlaunch-go init --replicaset --binary-dir ~/mongodb-sandboxes/downloads/mongodb-linux-x86_64-ubuntu2204-8.3.4/bin
 
-# Pass extra options to every mongod after "--"
+# Pass extra options to every mongod after "--" (here: override the 0.5 GB cache)
 ./mlaunch-go init --single --version 8.3.4 -- --wiredTigerCacheSizeGB 1
 
 # See which URL would be downloaded, without downloading
@@ -131,7 +145,8 @@ Requires Go ≥ 1.22. No third-party modules (stdlib only), so it builds offline
 ## How download resolution works
 
 1. The host is detected from `/etc/os-release` and `GOARCH`
-   (`x86_64`/`aarch64`).
+   (`x86_64`/`aarch64`); on macOS only the architecture matters
+   (`x86_64`/`arm64`).
 2. A ranked list of tarball variants is built. Example for Ubuntu 24.04
    x86_64 with `--version 8.3.4`:
 
@@ -150,19 +165,33 @@ Requires Go ≥ 1.22. No third-party modules (stdlib only), so it builds offline
    and platform flavors (`ol9`, `noble`, `jammy`, `bookworm`, …).
 5. `--url` bypasses resolution entirely; `--binary-dir` bypasses download.
 
+## macOS
+
+MongoDB Community publishes macOS tarballs, e.g.
+`https://fastdl.mongodb.org/osx/mongodb-macos-arm64-8.0.34.tgz`, so
+`init`, `start`, `stop`, `list` and friends work the same as on Linux with
+the default `--distro mongodb`. Percona Server for MongoDB and Percona
+Search (`--percona-search`) are published for Linux only; on macOS they
+are rejected with an explanatory error (`--binary-dir` still accepts any
+build you have compiled yourself). `show-repo` marks Percona versions with
+`-` in the HOST BUILD column. Process discovery uses the stock `lsof` and
+`ps` tools instead of `/proc`.
+
 ## Layout of a launched environment
 
 ```
-sandboxes/
-└── replicaset-3n-8.0.26/
-    ├── .mlaunch_startup.json      # persisted state (nodes, ports, args, pids)
-    ├── keyfile                    # only with --auth
-    └── data/
-        └── replset/
-            ├── rs1/db/            # dbpath per member
-            ├── rs1/mongod.conf    # editable; applied on next 'start'
-            ├── rs1/mongod.log
-            └── ...
+~/mongodb-sandboxes/
+├── downloads/                     # tarballs and extracted binaries (--download-dir)
+└── sandboxes/                     # environments (--dir)
+    └── replicaset-3n-8.0.26/
+        ├── .mlaunch_startup.json  # persisted state (nodes, ports, args, pids)
+        ├── keyfile                # only with --auth
+        └── data/
+            └── replset/
+                ├── rs1/db/        # dbpath per member
+                ├── rs1/mongod.conf  # editable; applied on next 'start'
+                ├── rs1/mongod.log
+                └── ...
 ```
 
 Everything binds to `127.0.0.1` only.
@@ -171,7 +200,7 @@ With `--percona-search` the environment is named `<topology>-<members>n-<version
 and gains a mongot per replica set (or per shard):
 
 ```
-sandboxes/
+~/mongodb-sandboxes/sandboxes/
 └── replicaset-3n-8.3.7-1-search/
     ├── .mlaunch_startup.json
     ├── keyfile

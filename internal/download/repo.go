@@ -19,7 +19,7 @@ type RepoEntry struct {
 	Version    string // "8.0.26" or "8.0.26-11" (Percona)
 	Dist       Distribution
 	Stable     bool // production release (MongoDB only; Percona tags are releases)
-	HostBuild  bool // a tarball exists for the host's arch/distro variant
+	HostBuild  bool // a tarball exists for the host's OS/arch/distro variant
 	Downloaded bool // tarball or extracted dir present in the download dir
 }
 
@@ -67,8 +67,9 @@ func ListRemoteMongoDB(host *platform.Info, major string) ([]RepoEntry, error) {
 		}
 		e := RepoEntry{Version: v.Version, Dist: DistMongoDB, Stable: v.ProductionRelease}
 		for _, d := range v.Downloads {
-			// Community distro-specific tarballs have edition "targeted".
-			if d.Edition == "targeted" && d.Arch == host.Arch && variants[d.Target] {
+			// Community distro-specific Linux tarballs have edition
+			// "targeted"; the macOS ones are "base" (target "macos").
+			if (d.Edition == "targeted" || d.Edition == "base") && d.Arch == host.Arch && variants[d.Target] {
 				e.HostBuild = true
 				break
 			}
@@ -84,8 +85,9 @@ var perconaTagRe = regexp.MustCompile(`\d+\.\d+\.\d+-\d+`)
 // ListRemotePercona lists Percona Server for MongoDB versions from the
 // project's GitHub release tags (e.g. "psmdb-8.0.4-1"), which conveniently
 // include the Percona build suffix. downloads.percona.com itself does not
-// offer directory listings.
-func ListRemotePercona(major string) ([]RepoEntry, error) {
+// offer directory listings. Percona publishes Linux tarballs only, so
+// HostBuild is false on other hosts.
+func ListRemotePercona(host *platform.Info, major string) ([]RepoEntry, error) {
 	seen := map[string]bool{}
 	var out []RepoEntry
 
@@ -127,7 +129,7 @@ func ListRemotePercona(major string) ([]RepoEntry, error) {
 				continue
 			}
 			seen[ver] = true
-			out = append(out, RepoEntry{Version: ver, Dist: DistPercona, Stable: true})
+			out = append(out, RepoEntry{Version: ver, Dist: DistPercona, Stable: true, HostBuild: host.OS == "linux"})
 		}
 	}
 	sortEntries(out)
@@ -138,8 +140,9 @@ var searchTagRe = regexp.MustCompile(`\d+\.\d+\.\d+(?:-\d+)?`)
 
 // ListRemoteSearch lists Percona Search for MongoDB (mongot) versions from
 // the project's GitHub release tags. Every release is published as a
-// tarball for both supported architectures, so HostBuild is always true.
-func ListRemoteSearch(major string) ([]RepoEntry, error) {
+// tarball for both supported Linux architectures, so HostBuild is true on
+// any Linux host and false elsewhere.
+func ListRemoteSearch(host *platform.Info, major string) ([]RepoEntry, error) {
 	seen := map[string]bool{}
 	var out []RepoEntry
 
@@ -181,7 +184,7 @@ func ListRemoteSearch(major string) ([]RepoEntry, error) {
 				continue
 			}
 			seen[ver] = true
-			out = append(out, RepoEntry{Version: ver, Dist: DistSearch, Stable: true, HostBuild: true})
+			out = append(out, RepoEntry{Version: ver, Dist: DistSearch, Stable: true, HostBuild: host.OS == "linux"})
 		}
 	}
 	sortEntries(out)
@@ -189,7 +192,7 @@ func ListRemoteSearch(major string) ([]RepoEntry, error) {
 }
 
 var (
-	localMongoRe   = regexp.MustCompile(`^mongodb-linux-[\w-]+-(\d+\.\d+\.\d+)(?:\.tgz)?$`)
+	localMongoRe   = regexp.MustCompile(`^mongodb-(?:linux|macos|osx)-[\w-]+-(\d+\.\d+\.\d+)(?:\.tgz)?$`)
 	localPerconaRe = regexp.MustCompile(`^percona-server-mongodb-(\d+\.\d+\.\d+-\d+)-.*?(?:\.tar\.gz)?$`)
 	// Both the tarball (percona-search-mongodb-1.70.3-linux_x86_64.tar.gz)
 	// and the versioned extraction directory (percona-search-mongodb-1.70.3).

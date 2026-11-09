@@ -32,6 +32,12 @@ import (
 	"github.com/PrzemekMalkowski/mlaunch-go/internal/table"
 )
 
+// defaultCacheSizeGB caps the WiredTiger cache of every mongod. Left to
+// itself each mongod sizes its cache as if it had the host to itself
+// (50% of RAM minus 1 GB), which overcommits memory as soon as a sandbox
+// runs several of them.
+const defaultCacheSizeGB = 0.5
+
 // StateFileName mirrors mlaunch's .mlaunch_startup marker.
 const StateFileName = ".mlaunch_startup.json"
 
@@ -418,6 +424,8 @@ func Init(t *Topology) (*State, error) {
 	if err := st.save(t.dir); err != nil {
 		return nil, err
 	}
+	table.StepDone("Prepared %s (%d process(es), ports %d-%d)",
+		table.Bold(envName), t.TotalMembers(), base, base+t.TotalPorts()-1)
 
 	var connAddr string
 	switch {
@@ -447,21 +455,30 @@ func Init(t *Topology) (*State, error) {
 	}
 
 	// Visually separate the init progress log from the final summary.
-	fmt.Println(table.Dim(strings.Repeat("─", 72)))
-	fmt.Printf("environment %s ready in %s\n", table.Bold(envName), t.dir)
-	fmt.Printf("%d process(es), ports from %d; state file: %s\n",
-		len(st.Nodes), base, statePath(t.dir))
+	fmt.Println(table.Rule(72))
+	if connAddr != "" {
+		table.Ready("Sandbox ready! Connect via: %s", table.Cyan(connString(st, connAddr)))
+	} else {
+		table.Ready("Sandbox %s ready!", envName)
+	}
+	summaryLine("environment", table.Bold(envName))
+	summaryLine("directory", t.dir)
+	summaryLine("processes", fmt.Sprintf("%d, ports from %d", len(st.Nodes), base))
+	summaryLine("state file", statePath(t.dir))
 	if t.Auth {
-		fmt.Printf("authentication enabled; default user: '%s' / '%s'\n", DefaultUser, DefaultPassword)
+		summaryLine("auth", fmt.Sprintf("enabled; default user '%s' / '%s'", DefaultUser, DefaultPassword))
 	}
 	if t.Search {
-		fmt.Printf("Percona Search enabled: %d mongot process(es), replication user '%s'\n",
-			t.searchInstances(), SearchUser)
-	}
-	if connAddr != "" {
-		fmt.Printf("connect: %s\n", table.Cyan(connString(st, connAddr)))
+		summaryLine("search", fmt.Sprintf("%d mongot process(es), replication user '%s'",
+			t.searchInstances(), SearchUser))
 	}
 	return st, nil
+}
+
+// summaryLine prints one "  label:  value" row of the final summary, with
+// the labels dimmed and aligned.
+func summaryLine(label, value string) {
+	fmt.Printf("  %s %s\n", table.Dim(fmt.Sprintf("%-12s", label+":")), value)
 }
 
 func (t *Topology) validate() error {
@@ -542,7 +559,7 @@ func mongodConf(t *Topology, name, dbpath, logPath string, port int, replSet, cl
 	b.WriteString("# Reference: https://www.mongodb.com/docs/manual/reference/configuration-options/\n\n")
 
 	fmt.Fprintf(&b, "storage:\n  dbPath: %s\n", dbpath)
-	b.WriteString("  # wiredTiger:\n  #   engineConfig:\n  #     cacheSizeGB: 1\n\n")
+	fmt.Fprintf(&b, "  wiredTiger:\n    engineConfig:\n      cacheSizeGB: %g\n\n", defaultCacheSizeGB)
 
 	fmt.Fprintf(&b, "systemLog:\n  destination: file\n  path: %s\n  logAppend: true\n", logPath)
 	b.WriteString("  # verbosity: 1\n\n")
@@ -626,54 +643,97 @@ func mongosConf(t *Topology, name, logPath string, port int, configDB, mongotAdd
 // ---------------------------------------------------------------- topologies
 
 func initSingle(t *Topology, st *State) (string, error) {
+	sp := table.StartStep("Starting mongod on port %d...", t.Port)
 	n, err := launchMongod(t, st, "single", t.Port, filepath.Join(t.dir, "data", "db"), "", "", "")
 	if err != nil {
+		sp.Fail("mongod failed to start on port %d", t.Port)
 		return "", err
 	}
+	table.Detail("waiting for connections")
 	if err := mongo.WaitReachable(hostPort(n.Port), 60*time.Second); err != nil {
+		sp.Fail("mongod on port %d did not accept connections", n.Port)
 		return "", err
 	}
+	sp.Done("Standalone mongod ready on port %d (pid %d)", n.Port, n.PID)
+
 	if t.Auth {
-		if err := createDefaultUser(hostPort(n.Port)); err != nil {
+		if err := createUserStep(hostPort(n.Port)); err != nil {
 			return "", err
 		}
 	}
-	fmt.Printf("launched standalone mongod on port %d (pid %d)\n", n.Port, n.PID)
 	return hostPort(n.Port), nil
 }
 
+// createUserStep creates the default user, reported as its own stage.
+func createUserStep(addr string) error {
+	sp := table.StartStep("Creating user %q...", DefaultUser)
+	if err := createDefaultUser(addr); err != nil {
+		sp.Fail("Could not create user %q", DefaultUser)
+		return err
+	}
+	sp.Done("Authentication enabled, user %q created", DefaultUser)
+	return nil
+}
+
 func initReplicaSet(t *Topology, st *State) (string, error) {
+	if t.Search {
+		table.StepDone("Configured mongod to connect to mongot on %s", t.mongotAddr(0))
+	}
+
+	sp := table.StartStep("Starting replica set %q (%s)...", t.Name, memberSummary(t.Nodes, t.Arbiters))
 	dataPorts, arbPorts, err := launchReplSetMembers(t, st, t.Name, t.Port, t.Nodes, t.Arbiters, "", t.mongotAddr(0))
 	if err != nil {
+		sp.Fail("Could not start the members of replica set %q", t.Name)
 		return "", err
 	}
+	sp.Done("Started %s on port(s) %s", memberSummary(t.Nodes, t.Arbiters),
+		joinPorts(append(append([]int{}, dataPorts...), arbPorts...)))
+
+	sp = table.StartStep("Initiating replica set %q...", t.Name)
+	table.Detail("waiting for a primary")
 	primary, err := initiateReplSet(t.Name, dataPorts, arbPorts, false)
 	if err != nil {
+		sp.Fail("Replica set %q did not come up", t.Name)
 		return "", err
 	}
+	sp.Done("Replica set %q initiated, primary on %s", t.Name, primary)
+
 	if t.Auth {
-		if err := createDefaultUser(primary); err != nil {
+		if err := createUserStep(primary); err != nil {
 			return "", err
 		}
 	}
 	if t.Search {
+		sp = table.StartStep("Starting mongot process...")
 		if err := createSearchUser(primary); err != nil {
+			sp.Fail("Could not create the mongot replication user")
 			return "", err
 		}
 		n, err := startSearch(t, st, 0, "mongot", primary, "")
 		if err != nil {
+			sp.Fail("mongot failed to start")
 			return "", err
 		}
-		fmt.Printf("mongot ready on port %d (health %d, metrics %d, pid %d)\n",
+		sp.Done("mongot ready on port %d (health %d, metrics %d, pid %d)",
 			n.Port, n.HealthPort, n.MetricsPort, n.PID)
 	}
-	if len(arbPorts) > 0 {
-		fmt.Printf("replica set %q initiated (%d data, %d arbiter); primary elected\n",
-			t.Name, len(dataPorts), len(arbPorts))
-	} else {
-		fmt.Printf("replica set %q initiated; primary elected\n", t.Name)
-	}
 	return primary, nil
+}
+
+// memberSummary describes a replica set's composition, e.g.
+// "3 data nodes" or "2 data nodes + 1 arbiter".
+func memberSummary(nodes, arbiters int) string {
+	s := fmt.Sprintf("%d data node", nodes)
+	if nodes != 1 {
+		s += "s"
+	}
+	if arbiters > 0 {
+		s += fmt.Sprintf(" + %d arbiter", arbiters)
+		if arbiters != 1 {
+			s += "s"
+		}
+	}
+	return s
 }
 
 func initSharded(t *Topology, st *State) (string, error) {
@@ -689,19 +749,30 @@ func initSharded(t *Topology, st *State) (string, error) {
 	// With --percona-search, the shard primaries mongot will replicate
 	// from, collected here and used after the routers are up.
 	var shardPrimaries, shardNames []string
+	if t.Search {
+		table.StepDone("Configured mongod to connect to mongot on %s and up",
+			t.mongotAddr(0))
+	}
 	for s := 1; s <= t.Sharded; s++ {
 		rsName := fmt.Sprintf("sh%02d", s)
+		sp := table.StartStep("Starting shard %s of %d (%s)...", rsName, t.Sharded,
+			memberSummary(t.Nodes, t.Arbiters))
 		dataPorts, arbPorts, err := launchReplSetMembers(t, st, rsName, port, t.Nodes, t.Arbiters, "shardsvr", t.mongotAddr(s-1))
 		if err != nil {
+			sp.Fail("Could not start the members of shard %s", rsName)
 			return "", err
 		}
 		port += t.Nodes + t.Arbiters
+		table.Detail("initiating replica set, waiting for a primary")
 		primary, err := initiateReplSet(rsName, dataPorts, arbPorts, false)
 		if err != nil {
+			sp.Fail("Shard %s did not come up", rsName)
 			return "", err
 		}
 		if t.Auth {
+			table.Detail("creating shard-local user %q", DefaultUser)
 			if err := createDefaultUser(primary); err != nil {
+				sp.Fail("Could not create the shard-local user on %s", rsName)
 				return "", fmt.Errorf("shard-local user on %s: %w", rsName, err)
 			}
 		}
@@ -712,7 +783,9 @@ func initSharded(t *Topology, st *State) (string, error) {
 		// the setup (the replication user) is done here, while the
 		// localhost exception makes it cheap.
 		if t.Search {
+			table.Detail("creating the mongot replication user")
 			if err := createSearchUser(primary); err != nil {
+				sp.Fail("Could not create the mongot user on %s", rsName)
 				return "", fmt.Errorf("search user on %s: %w", rsName, err)
 			}
 			shardPrimaries = append(shardPrimaries, primary)
@@ -720,25 +793,30 @@ func initSharded(t *Topology, st *State) (string, error) {
 		}
 		// Only data-bearing members go into the addShard seed list.
 		shardSpecs = append(shardSpecs, rsName+"/"+joinHostPorts(dataPorts))
-		fmt.Printf("shard %s ready (%s)\n", rsName, joinHostPorts(dataPorts))
+		sp.Done("Shard %s ready, primary on %s", rsName, primary)
 	}
 	if t.Auth {
-		fmt.Printf("shard-local user '%s' created on every shard (for direct shard connections)\n", DefaultUser)
+		table.StepDone("Shard-local user %q created on every shard (for direct connections)", DefaultUser)
 	}
 
 	// 2. Config server replica set (arbiters are not supported on CSRS).
 	csName := "configRepl"
+	sp := table.StartStep("Starting %d config server(s)...", t.ConfigSrv)
 	csPorts, _, err := launchReplSetMembers(t, st, csName, port, t.ConfigSrv, 0, "configsvr", "")
 	if err != nil {
+		sp.Fail("Could not start the config servers")
 		return "", err
 	}
 	port += t.ConfigSrv
+	table.Detail("initiating %s, waiting for a primary", csName)
 	if _, err := initiateReplSet(csName, csPorts, nil, true); err != nil {
+		sp.Fail("Config server replica set %s did not come up", csName)
 		return "", err
 	}
-	fmt.Printf("config server replica set ready (%s)\n", joinHostPorts(csPorts))
+	sp.Done("Config server replica set %s ready on port(s) %s", csName, joinPorts(csPorts))
 
 	// 3. mongos routers.
+	sp = table.StartStep("Starting %d mongos router(s)...", t.Mongos)
 	var mongosPorts []int
 	for m := 1; m <= t.Mongos; m++ {
 		// The mongot address is a startup parameter only: the processes
@@ -747,19 +825,24 @@ func initSharded(t *Topology, st *State) (string, error) {
 		if t.Search {
 			mongotAddr = t.mongotAddr(0)
 		}
+		table.Detail("mongos%d on port %d", m, port)
 		n, err := launchMongos(t, st, fmt.Sprintf("mongos%d", m), port,
 			csName+"/"+joinHostPorts(csPorts), mongotAddr)
 		if err != nil {
+			sp.Fail("mongos%d failed to start on port %d", m, port)
 			return "", err
 		}
 		mongosPorts = append(mongosPorts, n.Port)
 		port++
 	}
+	table.Detail("waiting for connections")
 	for _, p := range mongosPorts {
 		if err := mongo.WaitReachable(hostPort(p), 90*time.Second); err != nil {
+			sp.Fail("mongos on port %d did not accept connections", p)
 			return "", err
 		}
 	}
+	sp.Done("Started %d mongos router(s) on port(s) %s", t.Mongos, joinPorts(mongosPorts))
 
 	// 4. With auth: create the cluster-wide default user via the first
 	// mongos while the localhost exception is still open, then
@@ -770,12 +853,16 @@ func initSharded(t *Topology, st *State) (string, error) {
 	}
 	defer c.Close()
 	if t.Auth {
+		sp = table.StartStep("Creating user %q...", DefaultUser)
 		if err := createDefaultUser(hostPort(mongosPorts[0])); err != nil {
+			sp.Fail("Could not create user %q", DefaultUser)
 			return "", err
 		}
 		if err := c.Authenticate("admin", DefaultUser, DefaultPassword); err != nil {
+			sp.Fail("Could not authenticate as %q", DefaultUser)
 			return "", err
 		}
+		sp.Done("Authentication enabled, user %q created", DefaultUser)
 	}
 
 	// 5. Shards with arbiters can degrade the implicit default write
@@ -789,15 +876,19 @@ func initSharded(t *Topology, st *State) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("setDefaultRWConcern (required for shards with arbiters): %w", err)
 		}
-		fmt.Println("cluster-wide default write concern set to {w: 1} (shards contain arbiters)")
+		table.StepDone("Cluster-wide default write concern set to {w: 1} (shards contain arbiters)")
 	}
 
 	// 6. Register shards through the first mongos.
-	for _, spec := range shardSpecs {
+	sp = table.StartStep("Adding %d shard(s) to the cluster...", len(shardSpecs))
+	for i, spec := range shardSpecs {
+		table.Detail("shard %d/%d", i+1, len(shardSpecs))
 		if _, err := c.RunCommand("admin", mongo.D{{"addShard", spec}}); err != nil {
+			sp.Fail("Could not add shard %s", spec)
 			return "", fmt.Errorf("addShard %s: %w", spec, err)
 		}
 	}
+	sp.Done("Added %d shard(s) to the cluster", len(shardSpecs))
 	// 7. One mongot per shard, now that the cluster is complete: mongot
 	// checks at bootstrap that its config matches the real topology, and
 	// a shard only reports itself as sharded once it has been added.
@@ -806,19 +897,24 @@ func initSharded(t *Topology, st *State) (string, error) {
 	// the config servers, so it has to be created through mongos as well.
 	if t.Search {
 		router := hostPort(mongosPorts[0])
+		sp = table.StartStep("Starting %d mongot process(es)...", len(shardNames))
 		if err := createSearchUser(router); err != nil {
+			sp.Fail("Could not create the mongot user through mongos")
 			return "", fmt.Errorf("search user via mongos: %w", err)
 		}
 		for i, rsName := range shardNames {
+			table.Detail("mongot for shard %s (%d/%d)", rsName, i+1, len(shardNames))
 			n, err := startSearch(t, st, i, "mongot-"+rsName, shardPrimaries[i], router)
 			if err != nil {
+				sp.Fail("mongot for shard %s failed to start", rsName)
 				return "", fmt.Errorf("mongot for %s: %w", rsName, err)
 			}
-			fmt.Printf("mongot for shard %s ready on port %d (health %d, metrics %d, pid %d)\n",
+			sp.Note("mongot for shard %s ready on port %d (health %d, metrics %d, pid %d)",
 				rsName, n.Port, n.HealthPort, n.MetricsPort, n.PID)
 		}
+		sp.Done("Started %d mongot process(es), one per shard", len(shardNames))
 	}
-	fmt.Printf("sharded cluster ready: %d shard(s), %d config server(s), %d mongos on port(s) %s\n",
+	table.StepDone("Sharded cluster ready: %d shard(s), %d config server(s), %d mongos on port(s) %s",
 		t.Sharded, t.ConfigSrv, t.Mongos, joinPorts(mongosPorts))
 	return hostPort(mongosPorts[0]), nil
 }
@@ -849,9 +945,12 @@ func createDefaultUser(addr string) error {
 func launchReplSetMembers(t *Topology, st *State, rsName string, basePort, count, arbiters int, clusterRole, mongotAddr string) ([]int, []int, error) {
 	var dataPorts, arbPorts []int
 	port := basePort
+	total := count + arbiters
 	for i := 0; i < count; i++ {
 		name := fmt.Sprintf("%s-%d", rsName, i+1)
 		dbpath := filepath.Join(t.dir, "data", rsName, fmt.Sprintf("rs%d", i+1), "db")
+		// Annotates the stage the caller started, if any.
+		table.Detail("member %d/%d on port %d", i+1, total, port)
 		if _, err := launchMongod(t, st, name, port, dbpath, rsName, clusterRole, mongotAddr); err != nil {
 			return nil, nil, err
 		}
@@ -861,12 +960,14 @@ func launchReplSetMembers(t *Topology, st *State, rsName string, basePort, count
 	for i := 0; i < arbiters; i++ {
 		name := fmt.Sprintf("%s-arb%d", rsName, i+1)
 		dbpath := filepath.Join(t.dir, "data", rsName, fmt.Sprintf("arb%d", i+1), "db")
+		table.Detail("arbiter %d/%d on port %d", count+i+1, total, port)
 		if _, err := launchMongod(t, st, name, port, dbpath, rsName, clusterRole, mongotAddr); err != nil {
 			return nil, nil, err
 		}
 		arbPorts = append(arbPorts, port)
 		port++
 	}
+	table.Detail("waiting for %d member(s) to accept connections", total)
 	for _, p := range append(append([]int{}, dataPorts...), arbPorts...) {
 		if err := mongo.WaitReachable(hostPort(p), 60*time.Second); err != nil {
 			return nil, nil, err
@@ -980,7 +1081,7 @@ func spawn(binDir string, st *State, bin, name string, port int, dbpath, logPath
 }
 
 // waitForPID finds the forked daemon's PID by looking up the process
-// listening on the port via /proc.
+// listening on the port (see pidListeningOn).
 func waitForPID(port int) (int, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -990,63 +1091,6 @@ func waitForPID(port int) (int, error) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return 0, fmt.Errorf("no process found listening on port %d", port)
-}
-
-// pidListeningOn scans /proc to find the process listening on TCP port.
-func pidListeningOn(port int) (int, error) {
-	inode, err := listeningInode(port)
-	if err != nil {
-		return 0, err
-	}
-	procDirs, err := os.ReadDir("/proc")
-	if err != nil {
-		return 0, err
-	}
-	target := "socket:[" + inode + "]"
-	for _, pd := range procDirs {
-		pid, err := strconv.Atoi(pd.Name())
-		if err != nil {
-			continue
-		}
-		fdDir := filepath.Join("/proc", pd.Name(), "fd")
-		fds, err := os.ReadDir(fdDir)
-		if err != nil {
-			continue
-		}
-		for _, fd := range fds {
-			link, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
-			if err == nil && link == target {
-				return pid, nil
-			}
-		}
-	}
-	return 0, fmt.Errorf("owner of socket inode %s not found", inode)
-}
-
-// listeningInode parses /proc/net/tcp for a LISTEN socket on port.
-func listeningInode(port int) (string, error) {
-	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
-		data, err := os.ReadFile(file)
-		if err != nil {
-			continue
-		}
-		hexPort := fmt.Sprintf("%04X", port)
-		for _, line := range strings.Split(string(data), "\n")[1:] {
-			fields := strings.Fields(line)
-			if len(fields) < 10 {
-				continue
-			}
-			local := fields[1] // e.g. 0100007F:69B9
-			st := fields[3]    // 0A = LISTEN
-			if st != "0A" {
-				continue
-			}
-			if strings.HasSuffix(local, ":"+hexPort) {
-				return fields[9], nil
-			}
-		}
-	}
-	return "", fmt.Errorf("no listening socket on port %d", port)
 }
 
 func hostPort(p int) string { return "127.0.0.1:" + strconv.Itoa(p) }
@@ -1081,29 +1125,37 @@ func Stop(envDir string, kill, verbose bool) error {
 	if kill {
 		sig, sigName = syscall.SIGKILL, "SIGKILL"
 	}
-	stopped := 0
+	envName := filepath.Base(envDir)
+	sp := table.StartStep("Stopping %s with %s...", envName, sigName)
+
+	signaled := 0
 	pending := map[int]bool{} // indices of nodes we signaled and wait for
 	for i, n := range st.Nodes {
 		pid, ok := nodeAlive(n)
 		if !ok {
 			if verbose {
-				fmt.Printf("%s (port %d) not running\n", n.Name, n.Port)
+				sp.Note("%s (port %d) not running", n.Name, n.Port)
 			}
 			continue
 		}
 		n.PID = pid
-		if verbose {
-			fmt.Printf("stopping %s (port %d, pid %d) with %s ...\n", n.Name, n.Port, pid, sigName)
-		}
+		table.Detail("signalling %s (port %d, pid %d)", n.Name, n.Port, pid)
 		if err := syscall.Kill(pid, sig); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not signal %s (pid %d): %v\n", n.Name, pid, err)
+			sp.Note("warning: could not signal %s (pid %d): %v", n.Name, pid, err)
 			continue
 		}
-		stopped++
+		signaled++
 		pending[i] = true
 	}
 	st.save(envDir) // best effort: persist adopted PIDs
-	// Wait for shutdown, reporting each process as it goes away.
+
+	if signaled == 0 {
+		sp.Skip("Nothing to stop in %s: no recorded process is running", envName)
+		return nil
+	}
+
+	// Wait for shutdown, reporting each process as it goes away. A large
+	// environment can take a while: the detail line names what is left.
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) && len(pending) > 0 {
 		for i := range pending {
@@ -1112,19 +1164,37 @@ func Stop(envDir string, kill, verbose bool) error {
 				continue
 			}
 			if verbose {
-				fmt.Printf("stopped %s (port %d)\n", n.Name, n.Port)
+				sp.Note("stopped %s (port %d)", n.Name, n.Port)
 			}
 			delete(pending, i)
 		}
 		if len(pending) > 0 {
+			table.Detail("%d/%d stopped, waiting for %s",
+				signaled-len(pending), signaled, pendingNames(st, pending))
 			time.Sleep(300 * time.Millisecond)
 		}
 	}
 	if len(pending) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d process(es) still running after 60s\n", len(pending))
+		sp.Warn("[%s] stopped %d of %d process(es); %d still running after 60s (%s)",
+			envName, signaled-len(pending), signaled, len(pending), pendingNames(st, pending))
+		return nil
 	}
-	fmt.Printf("[%s] stopped %d process(es)\n", filepath.Base(envDir), stopped)
+	sp.Done("[%s] stopped %d process(es)", envName, signaled)
 	return nil
+}
+
+// pendingNames lists the nodes a stop is still waiting for, capped at
+// three names so the progress line stays short.
+func pendingNames(st *State, pending map[int]bool) string {
+	names := make([]string, 0, len(pending))
+	for i := range pending {
+		names = append(names, st.Nodes[i].Name)
+	}
+	sort.Strings(names) // map order is random; keep the line stable
+	if len(names) > 3 {
+		return fmt.Sprintf("%s +%d more", strings.Join(names[:3], ", "), len(names)-3)
+	}
+	return strings.Join(names, ", ")
 }
 
 // StopNode stops a single instance identified by its listening port or its
@@ -1168,24 +1238,28 @@ func StopNode(root, env string, port, pid int, kill, verbose bool) error {
 				continue
 			}
 			if !running {
-				fmt.Printf("[%s] %s (port %d) is not running\n", filepath.Base(d), n.Name, n.Port)
+				table.StepSkip("[%s] %s (port %d) is not running", filepath.Base(d), n.Name, n.Port)
 				return nil
 			}
+			sp := table.StartStep("Stopping %s (port %d) with %s...", n.Name, n.Port, sigName)
 			if verbose {
-				fmt.Printf("stopping %s (port %d, pid %d) with %s ...\n", n.Name, n.Port, n.PID, sigName)
+				sp.Note("signalling pid %d with %s", n.PID, sigName)
 			}
 			if err := syscall.Kill(n.PID, sig); err != nil {
+				sp.Fail("Could not signal %s (pid %d)", n.Name, n.PID)
 				return fmt.Errorf("could not signal %s (pid %d): %w", n.Name, n.PID, err)
 			}
 			st.save(d) // best effort: persist the adopted PID
 			deadline := time.Now().Add(60 * time.Second)
 			for time.Now().Before(deadline) && alive(n.PID) {
+				table.Detail("waiting for pid %d to exit", n.PID)
 				time.Sleep(300 * time.Millisecond)
 			}
 			if alive(n.PID) {
+				sp.Fail("%s (pid %d) is still running after 60s", n.Name, n.PID)
 				return fmt.Errorf("%s (pid %d) is still running after 60s", n.Name, n.PID)
 			}
-			fmt.Printf("[%s] stopped %s (port %d, pid %d)\n", filepath.Base(d), n.Name, n.Port, n.PID)
+			sp.Done("[%s] stopped %s (port %d, pid %d)", filepath.Base(d), n.Name, n.Port, n.PID)
 			return nil
 		}
 	}
@@ -1229,18 +1303,17 @@ func StartNode(root, env string, port int, verbose bool) error {
 			if pid, ok := nodeAlive(n); ok {
 				n.PID = pid // adopt the real daemon's PID
 				st.save(d)
-				fmt.Printf("[%s] %s already running on port %d (pid %d)\n",
+				table.StepSkip("[%s] %s already running on port %d (pid %d)",
 					filepath.Base(d), n.Name, n.Port, n.PID)
 				return nil
 			}
-			if verbose {
-				fmt.Printf("starting %s (%s) on port %d ...\n", n.Name, n.Kind, n.Port)
-			}
+			sp := table.StartStep("Starting %s (%s) on port %d...", n.Name, n.Kind, n.Port)
 			if err := launchRecorded(st, n, verbose); err != nil {
+				sp.Fail("[%s] %s failed to start on port %d", filepath.Base(d), n.Name, n.Port)
 				return fmt.Errorf("start %s: %w (see %s)", n.Name, err, n.LogPath)
 			}
 			st.save(d)
-			fmt.Printf("[%s] started %s on port %d (pid %d)\n",
+			sp.Done("[%s] started %s on port %d (pid %d)",
 				filepath.Base(d), n.Name, n.Port, n.PID)
 			return nil
 		}
@@ -1250,7 +1323,8 @@ func StartNode(root, env string, port int, verbose bool) error {
 
 // Destroy force-stops the environment and removes its directory. For
 // orphan directories without a state file, processes are found by scanning
-// /proc for command lines that reference the environment path.
+// the process table for mongod/mongos/mongot started with a config file
+// inside the environment (see envProcess).
 func Destroy(envDir string) error {
 	if _, err := LoadState(envDir); err == nil {
 		if err := Stop(envDir, true, false); err != nil {
@@ -1269,27 +1343,17 @@ func Destroy(envDir string) error {
 	return nil
 }
 
-// killByCmdline SIGKILLs every process whose command line contains path
-// (mongod/mongos launched by mlaunch-go always reference their config file
-// inside the environment directory). Returns the number of killed processes.
+// killByCmdline SIGKILLs every process that envProcess attributes to the
+// environment in path. Returns the number of killed processes.
 func killByCmdline(path string) int {
-	procDirs, err := os.ReadDir("/proc")
+	procs, err := listProcesses()
 	if err != nil {
 		return 0
 	}
 	self := os.Getpid()
 	killed := 0
-	for _, pd := range procDirs {
-		pid, err := strconv.Atoi(pd.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join("/proc", pd.Name(), "cmdline"))
-		if err != nil {
-			continue
-		}
-		cmdline := strings.ReplaceAll(string(raw), "\x00", " ")
-		if !strings.Contains(cmdline, path) {
+	for pid, p := range procs {
+		if pid == self || !envProcess(p, path) {
 			continue
 		}
 		if syscall.Kill(pid, syscall.SIGKILL) == nil {
@@ -1302,6 +1366,28 @@ func killByCmdline(path string) int {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return killed
+}
+
+// process is one entry of the process table.
+type process struct {
+	name    string // executable base name, e.g. "mongod"
+	cmdline string // arguments joined by spaces, starting with argv[0]
+}
+
+// envProcess reports whether p is a mongod, mongos or mongot launched by
+// mlaunch-go for the environment in envDir. All of them are started with
+// "--config <file inside envDir>" (the mongot launcher script execs the
+// bundled JVM with the arguments passed through). Matching on the
+// executable as well as that option keeps unrelated processes that merely
+// mention the path, such as a shell running 'mlaunch-go destroy --dir
+// <envDir>' or an editor with a mongod.conf open, out of the sweep.
+func envProcess(p process, envDir string) bool {
+	switch p.name {
+	case "mongod", "mongos", "java":
+	default:
+		return false
+	}
+	return strings.Contains(p.cmdline, " --config "+filepath.Clean(envDir)+string(os.PathSeparator))
 }
 
 // Start relaunches all nodes recorded in the environment's state file and
@@ -1322,45 +1408,125 @@ func Start(envDir string, verbose bool) error {
 		return err == nil && strings.Contains(string(data), "clusterRole: configsvr")
 	}
 
-	relaunch := func(match func(*Node) bool) error {
+	// relaunch brings up one group of nodes as a single reported stage.
+	// Groups that match nothing (mongos in a replica set, mongot without
+	// --percona-search) are silent.
+	relaunch := func(word string, match func(*Node) bool) error {
+		var group []*Node
 		for _, n := range st.Nodes {
-			if !match(n) {
-				continue
+			if match(n) {
+				group = append(group, n)
 			}
+		}
+		if len(group) == 0 {
+			return nil
+		}
+
+		sp := table.StartStep("Starting %d %s...", len(group), pluralOf(len(group), word))
+		var started, running int
+		var startedPorts []int
+		for i, n := range group {
+			table.Detail("%s on port %d (%d/%d)", n.Name, n.Port, i+1, len(group))
 			if pid, ok := nodeAlive(n); ok {
 				if pid != n.PID {
 					n.PID = pid // adopt the real daemon's PID
 				}
-				fmt.Printf("%s already running (pid %d)\n", n.Name, n.PID)
+				running++
 				continue
 			}
 			if verbose {
-				fmt.Printf("starting %s (%s) on port %d ...\n", n.Name, n.Kind, n.Port)
+				sp.Note("starting %s (%s) on port %d", n.Name, n.Kind, n.Port)
 			}
 			if err := launchRecorded(st, n, verbose); err != nil {
+				sp.Fail("%s failed to start on port %d", n.Name, n.Port)
 				return fmt.Errorf("restart %s: %w (see %s)", n.Name, err, n.LogPath)
 			}
 			st.save(envDir) // best effort, keeps PIDs fresh if a later node blocks
-			fmt.Printf("started %s on port %d (pid %d)\n", n.Name, n.Port, n.PID)
+			started++
+			startedPorts = append(startedPorts, n.Port)
+		}
+
+		switch {
+		case started == 0:
+			sp.Skip("All %d %s already running", running, pluralOf(running, word))
+		case running == 0:
+			sp.Done("Started %d %s on port(s) %s", started, pluralOf(started, word), joinPorts(startedPorts))
+		default:
+			sp.Done("Started %d %s on port(s) %s (%d already running)",
+				started, pluralOf(started, word), joinPorts(startedPorts), running)
 		}
 		return nil
 	}
 
-	for _, group := range []func(*Node) bool{
-		func(n *Node) bool { return n.Kind == "mongod" && isConfigSvr(n) },
-		func(n *Node) bool { return n.Kind == "mongod" && !isConfigSvr(n) },
+	groups := []struct {
+		word  string
+		match func(*Node) bool
+	}{
+		{"config server", func(n *Node) bool { return n.Kind == "mongod" && isConfigSvr(n) }},
+		{"mongod process", func(n *Node) bool { return n.Kind == "mongod" && !isConfigSvr(n) }},
 		// mongos before mongot: a sharded mongot contacts its router
 		// during bootstrap and crashes if it is not reachable. mongod
 		// does not need mongot at startup, so nothing is lost by
 		// starting search last.
-		func(n *Node) bool { return n.Kind == "mongos" },
-		func(n *Node) bool { return n.Kind == "mongot" },
-	} {
-		if err := relaunch(group); err != nil {
+		{"mongos router", func(n *Node) bool { return n.Kind == "mongos" }},
+		{"mongot process", func(n *Node) bool { return n.Kind == "mongot" }},
+	}
+	for _, g := range groups {
+		if err := relaunch(g.word, g.match); err != nil {
 			return err
 		}
 	}
-	return st.save(envDir)
+	if err := st.save(envDir); err != nil {
+		return err
+	}
+
+	fmt.Println(table.Rule(72))
+	if port := connectPort(st); port > 0 {
+		table.Ready("Environment %s is up! Connect via: %s",
+			filepath.Base(envDir), table.Cyan(connString(st, hostPort(port))))
+	} else {
+		table.Ready("Environment %s is up (%d process(es))",
+			filepath.Base(envDir), len(st.Nodes))
+	}
+	return nil
+}
+
+// connectPort picks the port a client should connect to: the first
+// running router for a sharded cluster, the current primary for a replica
+// set, the instance itself otherwise. It returns 0 when nothing suitable
+// is running.
+func connectPort(st *State) int {
+	port := 0
+	for _, n := range st.Nodes {
+		pid, ok := nodeAlive(n)
+		if !ok {
+			continue
+		}
+		n.PID = pid
+		switch st.Topology {
+		case "sharded":
+			if n.Kind == "mongos" && port == 0 {
+				return n.Port
+			}
+		case "replicaset":
+			if nodeRole(n) == "primary" {
+				return n.Port
+			}
+		default:
+			if port == 0 {
+				port = n.Port
+			}
+		}
+	}
+	return port
+}
+
+// pluralOf appends an "s" to word unless n is 1.
+func pluralOf(n int, word string) string {
+	if n == 1 {
+		return word
+	}
+	return word + "s"
 }
 
 // nodeRole queries a running node for its replica set role.
@@ -1574,24 +1740,17 @@ func List(root, env string) error {
 	return nil
 }
 
-// countByCmdline counts processes whose command line references path.
+// countByCmdline counts the processes envProcess attributes to the
+// environment in path.
 func countByCmdline(path string) int {
-	procDirs, err := os.ReadDir("/proc")
+	procs, err := listProcesses()
 	if err != nil {
 		return 0
 	}
 	self := os.Getpid()
 	count := 0
-	for _, pd := range procDirs {
-		pid, err := strconv.Atoi(pd.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join("/proc", pd.Name(), "cmdline"))
-		if err != nil {
-			continue
-		}
-		if strings.Contains(strings.ReplaceAll(string(raw), "\x00", " "), path) {
+	for pid, p := range procs {
+		if pid != self && envProcess(p, path) {
 			count++
 		}
 	}

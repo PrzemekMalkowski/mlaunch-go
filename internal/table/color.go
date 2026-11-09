@@ -12,8 +12,19 @@ import (
 	"regexp"
 )
 
-// colorEnabled is decided once at startup.
-var colorEnabled = detectColor()
+// stdoutTTY and colorEnabled are decided once at startup.
+var (
+	stdoutTTY    = isCharDevice(os.Stdout)
+	colorEnabled = detectColor()
+)
+
+func isCharDevice(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
 
 func detectColor() bool {
 	if _, set := os.LookupEnv("NO_COLOR"); set {
@@ -22,18 +33,18 @@ func detectColor() bool {
 	if os.Getenv("TERM") == "dumb" {
 		return false
 	}
-	fi, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
+	return stdoutTTY
 }
 
 // ColorEnabled reports whether ANSI colors are active for stdout.
 func ColorEnabled() bool { return colorEnabled }
 
+// IsTerminal reports whether stdout is a terminal.
+func IsTerminal() bool { return stdoutTTY }
+
 // DisableColor turns colors off for the rest of the process (used by a
-// --no-color flag, for example).
+// --no-color flag, for example). Step animation is disabled with it, so
+// the output contains no escape sequences at all (see step.go).
 func DisableColor() { colorEnabled = false }
 
 // SGR codes.
